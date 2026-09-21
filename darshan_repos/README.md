@@ -25,7 +25,7 @@ HEP-CCE/SOP darshan reops analysis
       `EventTreeName`: `NAME` or `NAME1,NAME2` or `all`
    2. map the offsets
       ```
-      python <darshan_record> --include_names inputRootFile  --enable_mapping --tree_branch_file <dump_{surfix}.json/dump_per_branch_{surfix}.json>
+      python plot_offset_histogram.py <darshan_record> --include_names inputRootFile  --enable_mapping --tree_branch_file <dump_{surfix}.json/dump_per_branch_{surfix}.json>
       ```
       In case of multiple collections, add `--conllection NAME/NAME1,NAME2/all`
       
