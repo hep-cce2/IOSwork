@@ -539,12 +539,20 @@ def generate_mapping_report(offset_mapping, format_bytes,
     print("  unknown:             Insufficient data (0 or 1 cluster).")
     print("--------------------------------------------------")
     
-def compute_reoperation_bytes(df):
+def compute_reoperation_bytes(df, collect_chunks=False):
     """
     Optimized version using binary search and sorted interval tracking.
     Handles 100k+ rows efficiently.
     Returns both the dataframe and a mapping of offsets to their total reoperation bytes
     along with the specific end-boundaries of those overlaps.
+
+    With collect_chunks=True every single overlap (one reread chunk) is also
+    recorded in df.attrs['reop_chunks'] as numpy arrays:
+        time  - start_time of the event doing the reread
+        tid   - pthread_id of that event (zeros if the log has no pthread_id)
+        start - first byte of the overlap
+        end   - one past the last byte of the overlap
+    The return value is unchanged, so existing callers keep working.
     """
     starts = df['offset'].values.astype(int)
     lengths = df['length'].values.astype(int)
@@ -557,7 +565,12 @@ def compute_reoperation_bytes(df):
     reop_offsets = set()
     reop_offsets_per_event = []
     offset_to_total_bytes = {}
-    
+
+    if collect_chunks:
+        tids = (df['pthread_id'].values if 'pthread_id' in df.columns
+                else np.zeros(len(df), dtype=np.int64))
+        ch_time, ch_tid, ch_start, ch_end = [], [], [], []
+
     for i in range(len(starts)):
         start, end = starts[i], ends[i]
         overlap = 0
@@ -579,13 +592,19 @@ def compute_reoperation_bytes(df):
             ov_end = min(end, e)
             overlap_amount = (ov_end - ov_start)
             overlap += overlap_amount
-            
+
             # Store 'bytes' and 'end' safely to allow accurate range intersection mapping
             if ov_start not in offset_to_total_bytes:
                 offset_to_total_bytes[ov_start] = {'bytes': 0, 'end': ov_end}
             offset_to_total_bytes[ov_start]['bytes'] += overlap_amount
             offset_to_total_bytes[ov_start]['end'] = max(offset_to_total_bytes[ov_start]['end'], ov_end)
-            
+
+            if collect_chunks:
+                ch_time.append(start_times[i])
+                ch_tid.append(tids[i])
+                ch_start.append(ov_start)
+                ch_end.append(ov_end)
+
             if ov_start == 0:
                 metadata_overlap_ctr += 1
             idx += 1
@@ -603,7 +622,15 @@ def compute_reoperation_bytes(df):
         covered.insert(insert_pos, new_int)
     df['reoperation'] = reoperation_bytes
     df['reoperation_offsets'] = reop_offsets_per_event
-    
+
+    if collect_chunks:
+        df.attrs['reop_chunks'] = {
+            'time':  np.asarray(ch_time, dtype=float),
+            'tid':   np.asarray(ch_tid, dtype=tids.dtype),
+            'start': np.asarray(ch_start, dtype=np.int64),
+            'end':   np.asarray(ch_end, dtype=np.int64),
+        }
+
     return df, reop_offsets, offset_to_total_bytes
 
 
@@ -914,6 +941,27 @@ def setup_parser(parser: argparse.ArgumentParser):
         type=str,
         help="Specify path to darshan log.",
     )
+    # Optional arguments for specifying non-default darshan paths
+    parser.add_argument(
+        "--darshan-util-path",
+        type=str,
+        default=None,
+        help="Path to a non-default darshan-util Python installation "
+             "(e.g. /path/to/darshan/lib/python3.x/site-packages, or a "
+             "darshan-util build's install prefix). Prepended to sys.path "
+             "before importing the darshan module. Can also be set via the "
+             "DARSHAN_PYTHON_PATH environment variable.",
+    )
+    parser.add_argument(
+        "--darshan-runtime-path",
+        type=str,
+        default=None,
+        help="Path to a non-default darshan-util shared library install "
+             "(sets LD_LIBRARY_PATH / DYLD_LIBRARY_PATH so the darshan "
+             "Python bindings can find libdarshan-util). Only needed if "
+             "darshan-util itself is not on the default library path.",
+    )
+
     # Optional arguments for Darshan record filtering and operation selection
     parser.add_argument(
         "--module",
@@ -1000,17 +1048,508 @@ def setup_parser(parser: argparse.ArgumentParser):
         help="Number of top branches/Fields to plot (default (all): -1)."
     )
 
+    # ---- per-pthread analysis (new DXT format with pthread_id) ----
+    parser.add_argument(
+        "--pthread_mode",
+        choices=["combined", "per_thread"],
+        default="combined",
+        help="combined: a segment is a reread if ANY earlier segment covered the "
+             "bytes (original behavior). per_thread: rereads are detected "
+             "independently inside each pthread_id, i.e. only same-thread "
+             "rereads are counted, and plots/reports are written per thread "
+             "(default: %(default)s)",
+    )
+    parser.add_argument(
+        "--pthread_ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Only analyze these pthread ids (per_thread mode and the heatmap). "
+             "Default: all threads.",
+    )
+
+    # ---- pthread heatmap ----
+    parser.add_argument(
+        "--pthread_heatmap",
+        action='store_true',
+        help="Write a summary heatmap: x = time, y = pthread_id, color = reread "
+             "size. With --enable_mapping the top branches/clusters are "
+             "highlighted. Needs a DXT log that has pthread_id.",
+    )
+    parser.add_argument(
+        "--heatmap_bins",
+        type=int,
+        default=200,
+        help="Number of time bins on the heatmap x axis (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--heatmap_max_threads",
+        type=int,
+        default=32,
+        help="Show at most this many thread rows (busiest first); the rest are "
+             "merged into one 'other' row. 0 = show all (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--heatmap_agg",
+        choices=["sum", "max"],
+        default="sum",
+        help="Cell color: 'sum' of reread bytes in the cell or the 'max' single "
+             "reread in the cell (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--heatmap_scope",
+        choices=["combined", "same_thread"],
+        default="combined",
+        help="combined: a reread is any overlap with ANY earlier read, attributed "
+             "to the thread doing the reread. same_thread: only overlaps with "
+             "earlier reads of the same thread count (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--heatmap_highlight",
+        choices=["branch", "cluster", "none"],
+        default="branch",
+        help="What to rank and highlight on the heatmap. Needs --enable_mapping "
+             "(default: %(default)s).",
+    )
+    parser.add_argument(
+        "--heatmap_top_k",
+        type=int,
+        default=5,
+        help="Number of top branches/clusters to highlight (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--heatmap_threshold",
+        type=float,
+        default=0.5,
+        help="A cell is outlined for a top branch/cluster when that branch/cluster "
+             "accounts for at least this fraction of the cell's reread bytes "
+             "(default: %(default)s).",
+    )
+
+
+def split_by_pthread(seg_df, thread_ids=None):
+    """
+    Split a DXT segment DataFrame into {pthread_id: DataFrame}.
+    Row order inside each thread is preserved (the interval tracking in
+    compute_reoperation_bytes depends on the original event order).
+    Returns None if the log has no pthread_id column (older DXT format).
+    """
+    if 'pthread_id' not in seg_df.columns or seg_df['pthread_id'].isna().all():
+        return None
+    wanted = set(int(t) for t in thread_ids) if thread_ids else None
+    groups = {}
+    for tid, g in seg_df.groupby('pthread_id', sort=True):
+        tid = int(tid)
+        if wanted is not None and tid not in wanted:
+            continue
+        groups[tid] = g.copy()
+    return groups
+
+
+def process_segments(seg_df, output_prefix, args, tree_branch_df, op, collect_chunks=False):
+    """Run the full reread pipeline on one set of segments. Returns total reread bytes."""
+    seg_df, global_reop_offsets, offset_to_bytes = compute_reoperation_bytes(seg_df, collect_chunks=collect_chunks)
+
+    offset_mapping = {}
+    if args.enable_mapping and not tree_branch_df.empty and global_reop_offsets:
+        print(f"\n--- Mapping {len(global_reop_offsets)} reread offsets to tree/branch entries ---")
+        offset_mapping = map_offsets_to_tree_branches(offset_to_bytes, tree_branch_df)
+        generate_mapping_report(offset_mapping, format_bytes, output_prefix=output_prefix,
+                                op=op, tree_branch_df=tree_branch_df)
+
+    hist_data = prepare_histogram_data(seg_df)
+    if hist_data:
+        if not args.no_plotting:
+            plot_offset_histogram(hist_data, output_prefix=output_prefix, op=op)
+        if args.enable_statistics:
+            report_top_bins_statistics(hist_data, seg_df, format_bytes,
+                                       top_bins=args.top_bins, top_events=args.top_events, op=op)
+    if not args.no_plotting:
+        plot_reoperation_offsets_over_time(seg_df, output_prefix=output_prefix, op=op)
+        if args.enable_mapping and offset_mapping:
+            plot_branch_reoperation_bytes(
+                offset_mapping,
+                format_bytes,
+                output_prefix=output_prefix + "_per_branch" if "per_branch" in args.tree_branch_file else output_prefix,
+                op=op,
+                tree_branch_df=tree_branch_df,
+                top_n=args.top_n_plot
+            )
+
+    print(seg_df)
+    print(args.time_sep)
+    if args.time_sep:
+        time_edges = [0] + [float(t) for t in args.time_sep] + [seg_df['end_time'].max()]
+        seg_df['interval'] = pd.cut(seg_df['start_time'], bins=time_edges, right=False)
+        results = seg_df.groupby('interval')['reoperation'].sum()
+        time_intervals = list(zip(time_edges[:-1], time_edges[1:]))
+        print(list(zip(time_intervals, results)))
+
+    total = int(seg_df['reoperation'].sum())
+    print(f"total overlapped bytes for {op}: ", total)
+    return total
+
+
+def print_pthread_summary(op, per_thread_stats, combined_total):
+    """Table of same-thread rereads per pthread + cross-thread remainder."""
+    same_thread_total = sum(s['reop'] for s in per_thread_stats.values())
+    print(f"\n=== Per-pthread {op} reread summary ===")
+    print(f"{'pthread_id':>22s} {'segments':>10s} {'reread bytes':>14s} {'% same-thread':>14s}")
+    for tid, s in sorted(per_thread_stats.items(), key=lambda kv: kv[1]['reop'], reverse=True):
+        pct = 100.0 * s['reop'] / same_thread_total if same_thread_total else 0.0
+        print(f"{tid:>22d} {s['segments']:>10d} {format_bytes(s['reop'], None):>14s} {pct:>13.1f}%")
+    print(f"Same-thread rereads (sum of threads): {format_bytes(same_thread_total, None)}")
+    if combined_total is not None:
+        cross = max(0, combined_total - same_thread_total)
+        print(f"Combined rereads (all threads)      : {format_bytes(combined_total, None)}")
+        print(f"Cross-thread-only rereads           : {format_bytes(cross, None)}")
+    print("=" * 40)
+
+    summary = {
+        "operation": op,
+        "same_thread_total_bytes": int(same_thread_total),
+        "combined_total_bytes": None if combined_total is None else int(combined_total),
+        "cross_thread_only_bytes": None if combined_total is None else int(max(0, combined_total - same_thread_total)),
+        "threads": {str(t): {"segments": s['segments'], "reoperation_bytes": int(s['reop'])}
+                    for t, s in per_thread_stats.items()},
+    }
+    return summary
+
+
+# ===========================================================================
+# pthread summary heatmap
+#   x = time, y = pthread_id, color = reread size per cell.
+#   Top branches / clusters (from the tree/branch mapping) are highlighted by
+#   outlining the cells they dominate and by stacking the marginal bars.
+# ===========================================================================
+
+def _short_thread_labels(ids):
+    """Shortest '…suffix' labels that are still unique across the given ids."""
+    full = [str(int(i)) for i in ids]
+    for n in range(4, 26):
+        lab = ["…" + s[-n:] if len(s) > n else s for s in full]
+        if len(set(lab)) == len(lab):
+            return lab
+    return full
+
+
+def collect_reread_chunks(seg_df, scope="combined", thread_ids=None):
+    """
+    Return the per-reread chunk arrays {'time','tid','start','end'}.
+      combined    : overlap with ANY earlier read, attributed to the thread
+                    that issued the later read.
+      same_thread : overlap only with earlier reads of the same thread.
+    Reuses the chunks recorded by a previous compute_reoperation_bytes(...,
+    collect_chunks=True) call when available, otherwise recomputes them.
+    """
+    if scope == "same_thread":
+        groups = split_by_pthread(seg_df, thread_ids) or {}
+        parts = []
+        for tid, g in groups.items():
+            g, _, _ = compute_reoperation_bytes(g, collect_chunks=True)
+            parts.append(g.attrs['reop_chunks'])
+        if not parts:
+            return None
+        chunks = {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
+    else:
+        chunks = seg_df.attrs.get('reop_chunks')
+        if chunks is None:
+            tmp, _, _ = compute_reoperation_bytes(seg_df.copy(), collect_chunks=True)
+            chunks = tmp.attrs['reop_chunks']
+        if thread_ids:
+            keep = np.isin(chunks['tid'], np.asarray(list(thread_ids), dtype=chunks['tid'].dtype))
+            chunks = {k: v[keep] for k, v in chunks.items()}
+    return chunks
+
+
+def _attribute_chunks_to_keys(cs, ce, tree_branch_df, key_col):
+    """
+    Intersect every reread chunk [cs, ce) with the tree/branch byte ranges.
+    Same intersection rule as map_offsets_to_tree_branches: the bytes credited
+    to a branch/cluster are exactly the bytes of the chunk inside its range.
+    Returns (chunk_index, key_code, bytes, key_names) as flat match arrays.
+    """
+    starts = tree_branch_df['Start_byte'].values.astype(np.int64)
+    if 'End_byte' in tree_branch_df.columns:
+        ends = (tree_branch_df['End_byte']
+                .fillna(tree_branch_df['Start_byte'] + tree_branch_df['Bytes'] - 1)
+                + 1).values.astype(np.int64)
+    else:
+        ends = (tree_branch_df['Start_byte'] + tree_branch_df['Bytes']).values.astype(np.int64)
+
+    codes, names = pd.factorize(tree_branch_df[key_col])
+    codes = np.asarray(codes)
+    order = np.argsort(starts, kind='stable')
+    starts, ends, codes = starts[order], ends[order], codes[order]
+    cummax_end = np.maximum.accumulate(ends)
+
+    # candidates for chunk i are entries [lo_i, hi_i): start < ce_i and
+    # (running max of end) > cs_i
+    his = np.searchsorted(starts, ce, side='left')
+    los = np.searchsorted(cummax_end, cs, side='right')
+
+    m_chunk, m_key, m_bytes = [], [], []
+    for i in np.nonzero(los < his)[0]:
+        lo, hi = los[i], his[i]
+        ov = np.minimum(ends[lo:hi], ce[i]) - np.maximum(starts[lo:hi], cs[i])
+        ok = ov > 0
+        n = int(ok.sum())
+        if n:
+            m_chunk.append(np.full(n, i, dtype=np.int64))
+            m_key.append(codes[lo:hi][ok])
+            m_bytes.append(ov[ok].astype(float))
+    if not m_chunk:
+        return (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64),
+                np.zeros(0), list(names))
+    return (np.concatenate(m_chunk), np.concatenate(m_key),
+            np.concatenate(m_bytes), list(names))
+
+
+# outline colors avoid red/orange/yellow so they stay visible on the YlOrRd cells
+_HIGHLIGHT_COLORS = ['#1f77b4', '#2ca02c', '#9467bd', '#17becf',
+                     '#8c564b', '#e377c2', '#003f5c', '#4d4d4d']
+
+
+def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
+                         op="operation", nbins=200, top_k=5, highlight="branch",
+                         threshold=0.5, max_threads=32, agg="sum"):
+    """
+    Summary heatmap of rereads per pthread over time, with top branches or
+    clusters highlighted. Writes <prefix>_pthread_heatmap.png/.json.
+    """
+    from matplotlib.collections import PatchCollection
+    from matplotlib.patches import Rectangle, Patch
+
+    if chunks is None or len(chunks['time']) == 0:
+        print(f"No reread chunks found, skipping pthread heatmap for {op}.")
+        return
+
+    t    = np.asarray(chunks['time'], dtype=float)
+    tid  = np.asarray(chunks['tid'])
+    cs   = np.asarray(chunks['start'], dtype=np.int64)
+    ce   = np.asarray(chunks['end'], dtype=np.int64)
+    size = (ce - cs).astype(float)
+
+    # ---- time bins -------------------------------------------------------
+    tmin, tmax = float(t.min()), float(t.max())
+    if tmax <= tmin:
+        tmax = tmin + 1.0
+    edges = np.linspace(tmin, tmax, nbins + 1)
+    dt    = edges[1] - edges[0]
+    tb    = np.clip(np.searchsorted(edges, t, side='right') - 1, 0, nbins - 1)
+
+    # ---- thread rows: busiest first, the rest merged into 'other' --------
+    uniq, inv = np.unique(tid, return_inverse=True)
+    inv = np.asarray(inv).ravel()
+    totals = np.bincount(inv, weights=size, minlength=len(uniq))
+    order  = np.argsort(-totals, kind='stable')
+    n_keep = len(uniq) if max_threads <= 0 else min(max_threads, len(uniq))
+    has_other = len(uniq) > n_keep
+    nrows = n_keep + (1 if has_other else 0)
+    row_of_uniq = np.full(len(uniq), n_keep, dtype=np.int64)       # default: 'other'
+    row_of_uniq[order[:n_keep]] = np.arange(n_keep)
+    rows = row_of_uniq[inv]
+    row_ids = [int(uniq[i]) for i in order[:n_keep]]
+    labels = _short_thread_labels(row_ids)
+    if has_other:
+        labels.append(f"other ({len(uniq) - n_keep} threads)")
+
+    # ---- matrices --------------------------------------------------------
+    ncell = nrows * nbins
+    flat  = rows * nbins + tb
+    S = np.bincount(flat, weights=size, minlength=ncell).reshape(nrows, nbins)   # sum of bytes
+    if agg == "max":
+        M = np.zeros(ncell)
+        np.maximum.at(M, flat, size)
+        M = M.reshape(nrows, nbins)
+    else:
+        M = S
+
+    # ---- top branches / clusters ----------------------------------------
+    top_keys, contrib = [], []
+    if highlight != "none" and tree_branch_df is not None and not tree_branch_df.empty:
+        key_col = 'Cluster' if highlight == 'cluster' else 'Branch'
+        m_chunk, m_key, m_bytes, key_names = _attribute_chunks_to_keys(cs, ce, tree_branch_df, key_col)
+        if m_chunk.size:
+            key_tot = np.bincount(m_key, weights=m_bytes, minlength=len(key_names))
+            ranked = [int(k) for k in np.argsort(-key_tot, kind='stable')[:max(top_k, 0)]
+                      if key_tot[k] > 0]
+            for k in ranked:
+                sel = m_key == k
+                c = np.bincount(flat[m_chunk[sel]], weights=m_bytes[sel],
+                                minlength=ncell).reshape(nrows, nbins)
+                contrib.append(c)
+                name = key_names[k]
+                top_keys.append({'name': f"cluster {int(name)}" if key_col == 'Cluster' else str(name),
+                                 'key': name if key_col == 'Branch' else int(name),
+                                 'bytes': float(key_tot[k])})
+        else:
+            print("Warning: no reread chunk intersects the tree/branch ranges; "
+                  "nothing to highlight on the heatmap.")
+    K = len(contrib)
+
+    if K:
+        if highlight == 'cluster':
+            # sequential ramp ordered by cluster index, spread evenly over the
+            # top-K so neighbouring clusters (e.g. 3, 4, 5) stay distinguishable
+            frac = np.empty(K)
+            frac[np.argsort([tk['key'] for tk in top_keys], kind='stable')] = \
+                np.linspace(0.0, 1.0, K) if K > 1 else 0.5
+            colors = [plt.cm.winter(float(f)) for f in frac]
+        else:
+            colors = [_HIGHLIGHT_COLORS[k % len(_HIGHLIGHT_COLORS)] for k in range(K)]
+    else:
+        colors = []
+
+    # ---- figure ----------------------------------------------------------
+    pos = M[M > 0]
+    if pos.size == 0:
+        print(f"Nothing to plot in the pthread heatmap for {op}.")
+        return
+    vmin, vmax = float(pos.min()), float(pos.max())
+    if vmin >= vmax:
+        vmin = vmax / 10.0
+    norm = LogNorm(vmin=vmin, vmax=vmax)
+
+    fig_h = float(min(16, max(6.5, 3.0 + 0.30 * nrows)))
+    fig = plt.figure(figsize=(14, fig_h))
+    gs = fig.add_gridspec(2, 3, width_ratios=[16, 2.6, 0.4], height_ratios=[2.2, 6],
+                          hspace=0.05, wspace=0.05)
+    ax  = fig.add_subplot(gs[1, 0])
+    axt = fig.add_subplot(gs[0, 0], sharex=ax)
+    axr = fig.add_subplot(gs[1, 1], sharey=ax)
+    cax = fig.add_subplot(gs[1, 2])
+
+    mesh = ax.pcolormesh(edges, np.arange(nrows + 1), np.ma.masked_less_equal(M, 0),
+                         cmap="YlOrRd", norm=norm, shading='flat')
+    ax.set_xlim(edges[0], edges[-1])
+    ax.set_ylim(nrows, 0)
+    ax.set_yticks(np.arange(nrows) + 0.5)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_ylabel("pthread_id")
+    ax.set_xlabel("Start time (s)")
+
+    lw = 1.6 if nbins <= 100 else 1.0
+    highlighted_cells = []
+    for k in range(K):
+        share = np.divide(contrib[k], S, out=np.zeros_like(S), where=S > 0)
+        ys, xs = np.nonzero(share >= threshold)
+        highlighted_cells.append([(int(y), int(x)) for y, x in zip(ys, xs)])
+        if len(ys):
+            rects = [Rectangle((edges[x], y), dt, 1) for y, x in zip(ys, xs)]
+            ax.add_collection(PatchCollection(rects, facecolor='none',
+                                              edgecolor=colors[k], linewidth=lw))
+
+    cbar = fig.colorbar(mesh, cax=cax,
+                        label=("Largest single reread per cell" if agg == "max"
+                               else "Reread bytes per cell"))
+    cbar.ax.yaxis.set_major_locator(ticker.LogLocator(base=4, numticks=8))
+    cbar.ax.yaxis.set_major_formatter(ticker.FuncFormatter(format_bytes))
+    cbar.ax.yaxis.set_minor_locator(ticker.NullLocator())
+
+    # top marginal: per time bin, stacked by top branches/clusters
+    centers = (edges[:-1] + edges[1:]) / 2
+    per_time_total = S.sum(axis=0)
+    bottom = np.zeros(nbins)
+    for k in range(K):
+        v = contrib[k].sum(axis=0)
+        axt.bar(centers, v, bottom=bottom, width=dt, color=colors[k], linewidth=0)
+        bottom += v
+    other_t = np.clip(per_time_total - bottom, 0, None)
+    axt.bar(centers, other_t, bottom=bottom, width=dt,
+            color="#bbbbbb" if K else "steelblue", linewidth=0)
+    axt.set_ylabel("per time bin", fontsize=8)
+    axt.tick_params(labelbottom=False, labelsize=8)
+    axt.yaxis.set_major_locator(ticker.MaxNLocator(nbins=4, steps=[1, 2, 4, 8, 10]))
+    axt.yaxis.set_major_formatter(ticker.FuncFormatter(format_bytes))
+    axt.set_title(f"Reread size per pthread over time ({op.capitalize()})",
+                  fontsize=11, fontweight="bold")
+
+    # right marginal: per thread row, stacked by top branches/clusters
+    ypos = np.arange(nrows) + 0.5
+    per_thread_total = S.sum(axis=1)
+    left = np.zeros(nrows)
+    for k in range(K):
+        v = contrib[k].sum(axis=1)
+        axr.barh(ypos, v, left=left, height=1, color=colors[k], linewidth=0)
+        left += v
+    other_r = np.clip(per_thread_total - left, 0, None)
+    axr.barh(ypos, other_r, left=left, height=1,
+             color="#bbbbbb" if K else "steelblue", linewidth=0)
+    axr.tick_params(labelleft=False, labelsize=8)
+    axr.xaxis.set_major_formatter(ticker.FuncFormatter(format_bytes))
+    axr.xaxis.set_major_locator(ticker.MaxNLocator(nbins=3, steps=[1, 2, 4, 8, 10]))
+    axr.set_xlabel("per thread", fontsize=8)
+
+    if K:
+        handles = [Patch(fc="none", ec=colors[k], lw=1.8, label=top_keys[k]['name'][:48])
+                   for k in range(K)]
+        handles.append(Patch(fc="#bbbbbb", label="other / unmapped"))
+        ax.legend(handles=handles,
+                  title=f"Top-{K} {highlight}s (outline = ≥{threshold:.0%} of the cell's reread bytes)",
+                  loc="upper center", bbox_to_anchor=(0.5, -0.12),
+                  ncol=min(3, K + 1), fontsize=8, title_fontsize=8, frameon=False)
+
+    png = f"{output_prefix}_pthread_heatmap.png"
+    fig.savefig(png, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+
+    # ---- JSON with the binned data, for reuse ------------------------------
+    out = {
+        "operation": op,
+        "agg": agg,
+        "threshold": threshold,
+        "highlight": highlight if K else "none",
+        "time_edges": [float(x) for x in edges],
+        "pthread_rows": [str(i) for i in row_ids] + (["other"] if has_other else []),
+        "pthread_labels": labels,
+        "cell_sum_bytes": [[int(v) for v in r] for r in S],
+        "cell_value": [[int(v) for v in r] for r in M],
+        "top": [
+            {**top_keys[k],
+             "highlighted_cells": [{"row": y, "time_bin": x} for y, x in highlighted_cells[k]]}
+            for k in range(K)
+        ],
+    }
+    with open(f"{output_prefix}_pthread_heatmap.json", "w") as f:
+        json.dump(out, f, indent=2)
+
+    print(f"pthread heatmap saved to {png}  ({nrows} rows x {nbins} time bins)")
+    for k in range(K):
+        print(f"  {k + 1}. {top_keys[k]['name'][:50]:50s} {format_bytes(top_keys[k]['bytes'], None):>10s}"
+              f"  outlined cells: {len(highlighted_cells[k])}")
+
+
+def run_pthread_heatmap(seg_df, output_prefix, args, tree_branch_df, op):
+    """Driver: validate the input, gather the chunks, draw the heatmap."""
+    if 'pthread_id' not in seg_df.columns or seg_df['pthread_id'].isna().all():
+        print(f"Warning: no 'pthread_id' in record '{output_prefix}' "
+              f"(older DXT log format); skipping the pthread heatmap.")
+        return
+    highlight = args.heatmap_highlight
+    if highlight != "none" and (not args.enable_mapping or tree_branch_df is None
+                                or tree_branch_df.empty):
+        print("Note: --enable_mapping with a loadable --tree_branch_file is needed "
+              "to highlight branches/clusters; drawing the heatmap without highlights.")
+        highlight = "none"
+    chunks = collect_reread_chunks(seg_df, args.heatmap_scope, args.pthread_ids)
+    plot_pthread_heatmap(chunks, tree_branch_df, output_prefix=output_prefix, op=op,
+                         nbins=args.heatmap_bins, top_k=args.heatmap_top_k,
+                         highlight=highlight, threshold=args.heatmap_threshold,
+                         max_threads=args.heatmap_max_threads, agg=args.heatmap_agg)
+
+
 def main(args: Union[Any, None] = None):
     """
-    Generates Plots and Statistics for Duplicate Read/Write Events in DXT records 
+    Generates Plots and Statistics for Duplicate Read/Write Events in DXT records
     """
     if args is None:
         parser = argparse.ArgumentParser(description="")
         setup_parser(parser)
         args = parser.parse_args()
     log_path = args.log_path
-    filter_patterns=None
-    filter_mode="exclude"
+    filter_patterns = None
+    filter_mode = "exclude"
     if args.exclude_names and args.include_names:
         print('Error: only one of --exclude_names and --include_names may be used.')
         sys.exit(1)
@@ -1021,15 +1560,15 @@ def main(args: Union[Any, None] = None):
         filter_patterns = args.include_names
         filter_mode = "include"
     mod = args.module
-    op  = args.op
-    
+    op = args.op
+
     # Load tree/branch data if mapping is enabled
     tree_branch_df = pd.DataFrame()
     if args.enable_mapping:
         if not args.tree_branch_file:
             print("Error: --tree_branch_file must be specified when --enable_mapping is used.")
             sys.exit(1)
-        
+
         tree_branch_df = load_tree_branch_data(args.tree_branch_file,
                                                collection=args.collection)
         if tree_branch_df.empty:
@@ -1037,61 +1576,64 @@ def main(args: Union[Any, None] = None):
         else:
             print(f"Loaded {len(tree_branch_df)} tree/branch entries for mapping.")
 
-    report = darshan.DarshanReport(log_path, read_all=True, filter_patterns=filter_patterns, filter_mode=filter_mode)
+    report = darshan.DarshanReport(log_path, read_all=True,
+                                   filter_patterns=filter_patterns, filter_mode=filter_mode)
     if mod not in report.records:
         print(f"Error: Module '{mod}' not found in the Darshan log.\n"
-            f"Please make sure that you requested one of the supported modules: DXT_POSIX or DXT_MPIIO and the log contains the requested module.\n"
-            f"Available modules in this log: {list(report.records.keys())}\n")
+              f"Please make sure that you requested one of the supported modules: DXT_POSIX or DXT_MPIIO and the log contains the requested module.\n"
+              f"Available modules in this log: {list(report.records.keys())}\n")
         sys.exit(1)
     dict_list = report.records[mod].to_df()
     seg_key = op + "_segments"
+    want_heatmap = bool(args.pthread_heatmap) and not args.no_plotting
     for idx, _dict in enumerate(dict_list):
         seg_df = _dict[seg_key]
         if not args.output_prefix:
             output_prefix = str(_dict.get('name', f"record_{idx}")).replace('/', '_').replace(' ', '_')
         else:
             output_prefix = args.output_prefix
-        if seg_df.size:
-            seg_df, global_reop_offsets, offset_to_bytes = compute_reoperation_bytes(seg_df)
-            
-            offset_mapping = {}
-            if args.enable_mapping and not tree_branch_df.empty and global_reop_offsets:
-                print(f"\n--- Mapping {len(global_reop_offsets)} reread offsets to tree/branch entries ---")
-                offset_mapping = map_offsets_to_tree_branches(offset_to_bytes, tree_branch_df)
-                generate_mapping_report(offset_mapping, format_bytes, output_prefix=output_prefix, op=op, tree_branch_df=tree_branch_df)
-            
-            hist_data = prepare_histogram_data(seg_df)
-            if hist_data:
-                if not args.no_plotting:
-                    plot_offset_histogram(hist_data, output_prefix=output_prefix, op=op)
-                if args.enable_statistics:
-                    report_top_bins_statistics(hist_data, seg_df, format_bytes, top_bins=args.top_bins, top_events=args.top_events, op=op)
-            if not args.no_plotting:
-                plot_reoperation_offsets_over_time(seg_df, output_prefix=output_prefix, op=op)
-                
-                if args.enable_mapping and offset_mapping:
-                    plot_branch_reoperation_bytes(
-                        offset_mapping, 
-                        format_bytes, 
-                        output_prefix=output_prefix+"_per_branch" if "per_branch" in args.tree_branch_file else output_prefix, 
-                        op=op, 
-                        tree_branch_df=tree_branch_df,
-                        top_n=args.top_n_plot
-                    )
-                    
-            print(seg_df)
-            print(args.time_sep)
-            if args.time_sep:
-                time_edges = [0] + [float(t) for t in args.time_sep] + [seg_df['end_time'].max()]
-                seg_df['interval'] = pd.cut(seg_df['start_time'], bins=time_edges, right=False)
-                results = seg_df.groupby('interval')['reoperation'].sum()
-                time_intervals = list(zip(time_edges[:-1], time_edges[1:]))
-                paired_results = list(zip(time_intervals, results))
-                print(paired_results)
 
-            print(f"total overlapped bytes for {op}: ", seg_df['reoperation'].sum())
-        else:
+        if not seg_df.size:
             print(f"No data found for '{op}' operation in record '{output_prefix}'. Skipping.")
+            continue
+
+        handled = False
+        if args.pthread_mode == "per_thread":
+            groups = split_by_pthread(seg_df, args.pthread_ids)
+            if groups is None:
+                print(f"Warning: '{mod}' segments in record '{output_prefix}' have no "
+                      f"'pthread_id' column (older DXT log format); falling back to combined mode.")
+            elif not groups:
+                print(f"No segments for the requested pthread ids in record '{output_prefix}'. Skipping.")
+                continue
+            else:
+                # Combined total (all threads) so cross-thread rereads can be derived.
+                # Only meaningful when no thread filter is applied.
+                combined_total = None
+                if not args.pthread_ids:
+                    tmp, _, _ = compute_reoperation_bytes(seg_df.copy())
+                    combined_total = int(tmp['reoperation'].sum())
+
+                per_thread_stats = {}
+                for tid, tdf in groups.items():
+                    print(f"\n########## pthread_id {tid}: {len(tdf)} {op} segments ##########")
+                    total = process_segments(tdf, f"{output_prefix}_tid{tid}",
+                                             args, tree_branch_df, op)
+                    per_thread_stats[tid] = {"segments": int(len(tdf)), "reop": total}
+
+                summary = print_pthread_summary(op, per_thread_stats, combined_total)
+                with open(f"{output_prefix}_pthread_summary.json", "w") as f:
+                    json.dump(summary, f, indent=2)
+                handled = True
+
+        if not handled:
+            # combined mode (original behavior); record the single rereads for
+            # the heatmap in the same pass when it is requested
+            process_segments(seg_df, output_prefix, args, tree_branch_df, op,
+                             collect_chunks=(want_heatmap and args.heatmap_scope == "combined"))
+
+        if want_heatmap:
+            run_pthread_heatmap(seg_df, output_prefix, args, tree_branch_df, op)
 
 
 if __name__ == "__main__":
