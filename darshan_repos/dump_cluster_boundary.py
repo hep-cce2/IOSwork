@@ -510,38 +510,96 @@ def clusterPrintRNTuple(ntuple, tree_name, input_file,
 
     return output
 
+def _resolve_collections(f, spec):
+    """
+    Turn the CLI spec into a list of (name, classname) pairs.
+      "Events"            -> [("Events", <class>)]
+      "Events,Runs,Lumis" -> three entries
+      "all" or "*"        -> every TTree/RNTuple key in the file
+    Duplicate keys (multiple cycles) are collapsed to one entry.
+    """
+    if spec in ("all", "*"):
+        found, seen = [], set()
+        for key in f.GetListOfKeys():
+            cls, name = key.GetClassName(), key.GetName()
+            if name in seen:
+                continue
+            if cls == "TTree" or "RNTuple" in cls:
+                seen.add(name)
+                found.append((name, cls))
+        return found
+
+    found = []
+    for name in dict.fromkeys(n.strip() for n in spec.split(",") if n.strip()):
+        key = f.FindKey(name)
+        if not key:
+            print(f"Warning: '{name}' not found in {f.GetName()}, skipping",
+                  file=sys.stderr)
+            continue
+        found.append((name, key.GetClassName()))
+    return found
+
+
+def _process_collection(f, input_file, name, classname, max_workers, per_branch):
+    if classname == "TTree":
+        return clusterPrintTTree(f.Get(name), input_file,
+                                 max_workers=max_workers, per_branch=per_branch)
+    if "RNTuple" in classname:
+        reader = ROOT.RNTupleReader.Open(name, input_file)
+        return clusterPrintRNTuple(reader, name, input_file,
+                                   max_workers=max_workers, per_branch=per_branch)
+    raise ValueError(f"Unsupported class '{classname}' for '{name}'")
+
+
 def main():
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} input.root tree_or_ntuple_name [max_workers] [per_branch=0/1] [output.json]")
+        print(f"Usage: {sys.argv[0]} input.root name[,name2,...]|all "
+              f"[max_workers] [per_branch=0/1] [output.json]")
         sys.exit(1)
 
-    input_file = sys.argv[1]
-    tree_name = sys.argv[2]
+    input_file  = sys.argv[1]
+    spec        = sys.argv[2]
     max_workers = int(sys.argv[3]) if len(sys.argv) > 3 else None
-    per_branch = bool(int(sys.argv[4])) if len(sys.argv) > 4 else False
+    per_branch  = bool(int(sys.argv[4])) if len(sys.argv) > 4 else False
     output_file = sys.argv[5] if len(sys.argv) > 5 else None
 
     f = ROOT.TFile.Open(input_file)
-    classname = f.FindKey(tree_name).GetClassName()
-    result = None
-    if classname == "TTree":
-        obj = f.Get(tree_name)
-        result = clusterPrintTTree(obj, input_file, max_workers=max_workers, per_branch=per_branch)
-    elif "RNTuple" in classname:
+    if not f or f.IsZombie():
+        print(f"Cannot open {input_file}", file=sys.stderr)
+        sys.exit(1)
+
+    collections = _resolve_collections(f, spec)
+    if not collections:
+        print("No matching TTree/RNTuple found.", file=sys.stderr)
+        sys.exit(1)
+
+    results, errors = {}, {}
+    for name, classname in collections:
         try:
-            ntuple = ROOT.RNTupleReader.Open(tree_name, input_file)
-            print(f"Opened RNTuple: {tree_name} from {input_file}")
-            result = clusterPrintRNTuple(ntuple, tree_name, input_file, max_workers=max_workers, per_branch=per_branch)
+            results[name] = _process_collection(
+                f, input_file, name, classname, max_workers, per_branch)
         except Exception as e:
-            print(f"Failed to open as RNTuple: {e}")
-            sys.exit(1)
+            errors[name] = str(e)
+            print(f"Failed to process '{name}': {e}", file=sys.stderr)
+    f.Close()
 
-    if result:
-        if output_file:
-            with open(output_file, 'w') as out_f:
-                json.dump(result, out_f, indent=2)
-        else:
-            print(json.dumps(result, indent=2))
+    if not results:
+        sys.exit(1)
 
+    # Single collection requested explicitly: keep the original output shape
+    # so existing consumers keep working.
+    if len(collections) == 1 and spec not in ("all", "*"):
+        result = next(iter(results.values()))
+    else:
+        result = {"file_name": input_file, "collections": results}
+        if errors:
+            result["errors"] = errors
+
+    if output_file:
+        with open(output_file, "w") as out_f:
+            json.dump(result, out_f, indent=2)
+    else:
+        print(json.dumps(result, indent=2))
+        
 if __name__ == "__main__":
     main()

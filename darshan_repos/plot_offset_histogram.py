@@ -42,145 +42,154 @@ def format_bytes(y, pos):
         return f"{y_fmt:,.1f}{size_name[i_fmt]}"
 
 
-def load_tree_branch_data(tree_branch_file):
-    """Load cluster/branch data from JSON. Supports TTree and RNTuple formats."""
+def _rows_from_dump(data, collection=None, prefix_names=False):
+    """Flatten ONE collection dict (the old flat shape) into DataFrame rows."""
+    data_type = data.get("type", "TTree")
+    coll_name = collection or data.get("tree_name", "")
+
+    def name_of(n):
+        return f"{coll_name}/{n}" if prefix_names and coll_name else n
+
+    rows = []
+    for cluster in data.get("clusters", []):
+        common = {
+            'Collection': coll_name,
+            'Cluster':    cluster["cluster_index"],
+            'Begin':      cluster["begin"],
+            'End':        cluster["end"],
+            'Entries':    cluster["entries"],
+        }
+        defaults = {
+            'Column_id': -1, 'Field_id': -1, 'Column_type': '',
+            'Uncompressed_bytes': 0, 'Page_index': -1, 'N_elements': 0,
+            'Is_compressed': False,
+        }
+
+        if data_type == "RNTuple" and "fields" in cluster:
+            for fd in cluster["fields"]:
+                base = {**common, **defaults,
+                        'Branch':      name_of(fd["field"]),
+                        'Column_id':   fd.get("column_id", -1),
+                        'Field_id':    fd.get("field_id", -1),
+                        'Column_type': fd.get("column_type", "")}
+                pages = fd.get("pages", [])
+                if pages:
+                    for p in pages:
+                        rows.append({**base,
+                            'Start_byte':         p["offset"],
+                            'End_byte':           p["end"] - 1,
+                            'Bytes':              p["compressed_bytes"],
+                            'Uncompressed_bytes': p.get("uncompressed_bytes", 0),
+                            'Baskets':            1,
+                            'Page_index':         p["page_index"],
+                            'N_elements':         p.get("n_elements", 0),
+                            'Is_compressed':      p.get("is_compressed", False),
+                            'Granularity':        'page'})
+                else:
+                    rows.append({**base,
+                        'Start_byte':         fd.get("start_byte", 0),
+                        'End_byte':           fd.get("end_byte", 0),
+                        'Bytes':              fd.get("compressed_bytes", 0),
+                        'Uncompressed_bytes': fd.get("uncompressed_bytes", 0),
+                        'Baskets':            fd.get("n_pages", 1),
+                        'Granularity':        'field'})
+
+        elif "branches" in cluster:
+            for bd in cluster["branches"]:
+                rows.append({**common, **defaults,
+                    'Branch':      name_of(bd["branch"]),
+                    'Start_byte':  bd["start_byte"],
+                    'End_byte':    bd["end_byte"],
+                    'Bytes':       bd["bytes"],
+                    'Baskets':     bd.get("baskets", 1),
+                    'Granularity': 'basket'})
+
+        else:  # cluster-level fallback
+            # Not prefixed: downstream plotting keys on the "cluster_" name.
+            rows.append({**common, **defaults,
+                'Branch':             f'cluster_{cluster["begin"]}_{cluster["end"]}',
+                'Start_byte':         cluster["start_byte"],
+                'End_byte':           cluster["end_byte"],
+                'Bytes':              cluster["total_bytes"],
+                'Uncompressed_bytes': cluster.get("uncompressed_bytes", 0),
+                'Baskets':            cluster.get("max_baskets",
+                                                  cluster.get("max_pages", 1)),
+                'Granularity':        'cluster'})
+    return rows
+
+
+def _select_collections(data, requested):
+    """
+    Return [(name, collection_dict), ...] for either JSON layout.
+      old flat shape      -> one entry, named by its tree_name
+      new multi shape     -> filtered by `requested` (comma list or 'all')
+    """
+    if "collections" not in data:
+        return [(data.get("tree_name", ""), data)]
+
+    available = data["collections"]
+    for name, msg in data.get("errors", {}).items():
+        print(f"Warning: collection '{name}' failed during dump: {msg}")
+
+    if requested is None:
+        if len(available) == 1:
+            return list(available.items())
+        print("Error: tree/branch file contains multiple collections; "
+              "choose with --collection NAME[,NAME2,...] or --collection all.")
+        print(f"Available: {list(available)}")
+        sys.exit(1)
+
+    if requested in ("all", "*"):
+        return list(available.items())
+
+    names = [n.strip() for n in requested.split(",") if n.strip()]
+    missing = [n for n in names if n not in available]
+    if missing:
+        print(f"Error: collection(s) {missing} not in file. "
+              f"Available: {list(available)}")
+        sys.exit(1)
+    return [(n, available[n]) for n in names]
+
+
+def load_tree_branch_data(tree_branch_file, collection=None):
+    """Load cluster/branch data from JSON.
+    Supports TTree and RNTuple, in both the original single-collection
+    output and the multi-collection ('collections') output."""
     try:
         with open(tree_branch_file, 'r') as f:
             data = json.load(f)
+    except Exception as e:
+        print(f"Error loading tree/branch data: {e}")
+        return pd.DataFrame()
 
-        data_type = data.get("type", "TTree")
-        clusters  = data.get("clusters", [])
-        rows      = []
+    selected = _select_collections(data, collection)   # may sys.exit on bad names
+    multi = len(selected) > 1
 
-        for cluster in clusters:
-            cluster_idx = cluster["cluster_index"]
-            begin       = cluster["begin"]
-            end         = cluster["end"]
-            entries     = cluster["entries"]
+    if multi and any(d.get("type", "TTree") == "TTree" for _, d in selected):
+        print("Warning: TTree byte ranges are cumulative per-tree cursors, not "
+              "file offsets, so they overlap between collections. Mapping "
+              "against several collections that include a TTree is ambiguous; "
+              "prefer selecting one.")
 
-            if data_type == "RNTuple" and "fields" in cluster:
-                # ── RNTuple path ──────────────────────────────────────────
-                for field_data in cluster["fields"]:
-                    field_name   = field_data["field"]
-                    column_id    = field_data.get("column_id", -1)
-                    field_id     = field_data.get("field_id", -1)
-                    column_type  = field_data.get("column_type", "")
-                    comp_bytes   = field_data.get("compressed_bytes", 0)   # was "bytes"
-                    uncomp_bytes = field_data.get("uncompressed_bytes", 0)
-                    n_pages      = field_data.get("n_pages", 1)
-
-                    pages = field_data.get("pages", [])
-                    if pages:
-                        # Prefer page-level granularity when available:
-                        # each page becomes its own row so offset mapping
-                        # can resolve to the exact page, not just the field.
-                        for page in pages:
-                            rows.append({
-                                'Cluster':            cluster_idx,
-                                'Branch':             field_name,
-                                'Column_id':          column_id,
-                                'Field_id':           field_id,
-                                'Column_type':        column_type,
-                                'Begin':              begin,
-                                'End':                end,
-                                'Entries':            entries,
-                                'Start_byte':         page["offset"],
-                                'End_byte':           page["end"] - 1,
-                                'Bytes':              page["compressed_bytes"],
-                                'Uncompressed_bytes': page.get("uncompressed_bytes", 0),
-                                'Baskets':            1,           # one page = one unit
-                                'Page_index':         page["page_index"],
-                                'N_elements':         page.get("n_elements", 0),
-                                'Is_compressed':      page.get("is_compressed", False),
-                                'Granularity':        'page',
-                            })
-                    else:
-                        # Fall back to field-level if pages were not written
-                        rows.append({
-                            'Cluster':            cluster_idx,
-                            'Branch':             field_name,
-                            'Column_id':          column_id,
-                            'Field_id':           field_id,
-                            'Column_type':        column_type,
-                            'Begin':              begin,
-                            'End':                end,
-                            'Entries':            entries,
-                            'Start_byte':         field_data.get("start_byte", 0),
-                            'End_byte':           field_data.get("end_byte", 0),
-                            'Bytes':              comp_bytes,
-                            'Uncompressed_bytes': uncomp_bytes,
-                            'Baskets':            n_pages,
-                            'Page_index':         -1,
-                            'N_elements':         0,
-                            'Is_compressed':      False,
-                            'Granularity':        'field',
-                        })
-
-            elif "branches" in cluster:
-                # ── TTree path ────────────────────────────────────────────
-                for branch_data in cluster["branches"]:
-                    rows.append({
-                        'Cluster':            cluster_idx,
-                        'Branch':             branch_data["branch"],
-                        'Column_id':          -1,
-                        'Field_id':           -1,
-                        'Column_type':        '',
-                        'Begin':              begin,
-                        'End':               end,
-                        'Entries':            entries,
-                        'Start_byte':         branch_data["start_byte"],
-                        'End_byte':           branch_data["end_byte"],
-                        'Bytes':              branch_data["bytes"],
-                        'Uncompressed_bytes': 0,
-                        'Baskets':            branch_data.get("baskets", 1),
-                        'Page_index':         -1,
-                        'N_elements':         0,
-                        'Is_compressed':      False,
-                        'Granularity':        'basket',
-                    })
-
-            else:
-                # ── cluster-level fallback (no per-branch/field data) ─────
-                rows.append({
-                    'Cluster':            cluster_idx,
-                    'Branch':             f'cluster_{begin}_{end}',
-                    'Column_id':          -1,
-                    'Field_id':           -1,
-                    'Column_type':        '',
-                    'Begin':              begin,
-                    'End':                end,
-                    'Entries':            entries,
-                    'Start_byte':         cluster["start_byte"],
-                    'End_byte':           cluster["end_byte"],
-                    'Bytes':              cluster["total_bytes"],
-                    'Uncompressed_bytes': cluster.get("uncompressed_bytes", 0),
-                    'Baskets':            cluster.get("max_baskets",
-                                          cluster.get("max_pages", 1)),
-                    'Page_index':         -1,
-                    'N_elements':         0,
-                    'Is_compressed':      False,
-                    'Granularity':        'cluster',
-                })
+    try:
+        rows = []
+        for name, d in selected:
+            rows.extend(_rows_from_dump(d, collection=name, prefix_names=multi))
 
         df = pd.DataFrame(rows)
-
         if not df.empty:
-            print(f"Loaded DataFrame from {data_type}")
-            print(f"Columns:     {list(df.columns)}")
+            kinds = {n: d.get("type", "TTree") for n, d in selected}
+            print(f"Loaded DataFrame from {kinds}")
             print(f"Shape:       {df.shape}")
             print(f"Granularity: {df['Granularity'].value_counts().to_dict()}")
             print(f"First few rows:\n{df.head()}")
         else:
             print("Warning: No data loaded from the file")
-
         return df
-
     except Exception as e:
         print(f"Error loading tree/branch data: {e}")
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         return pd.DataFrame()
-
 
 def map_offsets_to_tree_branches(reop_data, tree_branch_df):
     """
@@ -274,6 +283,7 @@ def map_offsets_to_tree_branches(reop_data, tree_branch_df):
             attributed_reop_bytes = total_reop_bytes * ratio
 
             match = {
+                'collection':           str(row['Collection']) if 'Collection' in row.index else '',
                 'cluster':              row['Cluster'],
                 'branch':               row['Branch'],
                 'begin':                row['Begin'],
@@ -335,6 +345,7 @@ be tracked to identify specific physical column bottlenecks.
 def _match_to_json(m, format_bytes, offset=None):
     """Serialize a full match dict to JSON-safe native types, keeping every field."""
     out = {
+        'collection':                  str(m.get('collection', '')),
         'cluster':                     int(m['cluster']),
         'branch':                      str(m['branch']),
         'begin':                       int(m['begin']),
@@ -903,6 +914,7 @@ def setup_parser(parser: argparse.ArgumentParser):
         type=str,
         help="Specify path to darshan log.",
     )
+    # Optional arguments for Darshan record filtering and operation selection
     parser.add_argument(
         "--module",
         "-m",
@@ -928,7 +940,8 @@ def setup_parser(parser: argparse.ArgumentParser):
         "--include_names",
         action='append',
         help="regex patterns for file record names to include"
-     )
+    )
+    # Optional arguments for statistics and plotting
     parser.add_argument(
         "--enable_statistics",
         action='store_true',
@@ -947,12 +960,6 @@ def setup_parser(parser: argparse.ArgumentParser):
         help="Number of top events per bin to report in statistics (default: 10)."
     )
     parser.add_argument(
-        "--top_n_plot",
-        type=int,
-        default=-1,
-        help="Number of top branches/Fields to plot (default (all): -1)."
-    )
-    parser.add_argument(
         "--output_prefix",
         type=str,
         help="Specify prefix of the output plots",
@@ -967,17 +974,31 @@ def setup_parser(parser: argparse.ArgumentParser):
         action='store_true',
         help="disable plotting",
     )
+    # Additional arguments for mapping
+    parser.add_argument(
+        "--enable_mapping",
+        action='store_true',
+        help="Enable mapping of reread offsets to tree/branch entries (requires --tree_branch_file)",
+    )
     parser.add_argument(
         "--tree_branch_file",
         type=str,
         help="Path to tree/branch data JSON file from cluster analysis script",
     )
     parser.add_argument(
-        "--enable_mapping",
-        action='store_true',
-        help="Enable mapping of reread offsets to tree/branch entries (requires --tree_branch_file)",
+        "--collection",
+        type=str,
+        default=None,
+        help="Collection(s) to use from a multi-collection tree/branch JSON: "
+             "NAME, NAME1,NAME2, or 'all'. Optional if the file holds one "
+             "collection or uses the original single-collection format.",
     )
-
+    parser.add_argument(
+        "--top_n_plot",
+        type=int,
+        default=-1,
+        help="Number of top branches/Fields to plot (default (all): -1)."
+    )
 
 def main(args: Union[Any, None] = None):
     """
@@ -1009,7 +1030,8 @@ def main(args: Union[Any, None] = None):
             print("Error: --tree_branch_file must be specified when --enable_mapping is used.")
             sys.exit(1)
         
-        tree_branch_df = load_tree_branch_data(args.tree_branch_file)
+        tree_branch_df = load_tree_branch_data(args.tree_branch_file,
+                                               collection=args.collection)
         if tree_branch_df.empty:
             print("Warning: Could not load tree/branch data. Mapping will be skipped.")
         else:
