@@ -1318,6 +1318,9 @@ def print_pthread_summary(op, per_thread_stats, combined_total):
         cross = max(0, combined_total - same_thread_total)
         print(f"Combined rereads (all threads)      : {format_bytes(combined_total, None)}")
         print(f"Cross-thread-only rereads           : {format_bytes(cross, None)}")
+    print("Definitions: same-thread = bytes a thread re-read that it had read itself earlier;")
+    print("  cross-thread = bytes re-read that only OTHER threads had read earlier; combined = overlap")
+    print("  with any earlier read by any thread (same-thread + cross-thread).")
     print("=" * 40)
 
     summary = {
@@ -1515,6 +1518,24 @@ def _attribute_chunks_to_keys(cs, ce, tree_branch_df, key_col):
             np.concatenate(m_bytes), list(names))
 
 
+def print_reread_definitions(scope="split"):
+    """Plain-language definitions of the reread terms used in the log and plots."""
+    print("\n  Definitions (reads are processed in time order; a 'reread' is any byte that")
+    print("  was already read earlier; each reread is credited to the thread that issues the later read):")
+    if scope in ("split", "per_thread"):
+        print("    same-thread  : reread bytes that THIS thread had already read itself earlier.")
+        print("    cross-thread : reread bytes that were read earlier ONLY by OTHER threads and never by")
+        print("                   this thread (new for this thread, but redundant for the process).")
+        print("    total        : same-thread + cross-thread = all bytes re-read by this thread, i.e. the")
+        print("                   'combined' reread (overlap with any earlier read by any thread).")
+    elif scope == "same_thread":
+        print("    reread       : only overlaps with earlier reads of the SAME thread (cross-thread")
+        print("                   rereads are not counted in this scope).")
+    else:
+        print("    reread       : overlap with an earlier read by ANY thread (same-thread + cross-thread")
+        print("                   are not separated in this scope).")
+
+
 def format_bytes_axis(y, pos=None):
     """Compact byte label for plot axes: 0B, 512B, 1.5KB, 128GB (never '195,312,500KB')."""
     y = float(y)
@@ -1556,7 +1577,8 @@ _HIGHLIGHT_COLORS = ['#1f77b4', '#2ca02c', '#9467bd', '#17becf',
 
 def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
                          op="operation", nbins=200, top_k=5, highlight="branch",
-                         threshold=0.5, max_threads=32, agg="sum", all_tids=None):
+                         threshold=0.5, max_threads=32, agg="sum", all_tids=None,
+                         scope=None):
     """
     Summary heatmap of rereads per pthread over time, with top branches or
     clusters highlighted. Writes <prefix>_pthread_heatmap.png/.json.
@@ -1826,6 +1848,8 @@ def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
             print(f"  {k + 1}. {names_p[k]:{col}s} {format_bytes(top_keys[k]['bytes'], None):>10s}"
                   f"  outlined cells: {len(highlighted_cells[k])}")
 
+    print_reread_definitions(scope or ("split" if split else "combined"))
+
     # every pthread in the record, busiest first, with the full id behind each row label
     print(f"\n  All {len(uniq)} pthreads in this record "
           f"(heatmap row label -> full pthread_id; reread bytes {op}):")
@@ -1869,7 +1893,7 @@ def run_pthread_heatmap(seg_df, output_prefix, args, tree_branch_df, op):
                          nbins=args.heatmap_bins, top_k=args.heatmap_top_k,
                          highlight=highlight, threshold=args.heatmap_threshold,
                          max_threads=args.heatmap_max_threads, agg=args.heatmap_agg,
-                         all_tids=all_tids)
+                         all_tids=all_tids, scope=args.heatmap_scope)
 
 
 def main(args: Union[Any, None] = None):
