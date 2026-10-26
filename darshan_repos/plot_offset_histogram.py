@@ -42,6 +42,61 @@ def format_bytes(y, pos):
         return f"{y_fmt:,.1f}{size_name[i_fmt]}"
 
 
+# Default width for printed / plotted branch names (0 = never shorten).
+# Set from --name_width in main().
+NAME_WIDTH = 70
+
+
+def shorten_name(name, width):
+    """
+    Shorten one name to at most `width` characters, keeping BOTH the start
+    (collection / container) and the end (the field that tells siblings apart):
+        EventData/InDetTrackParticlesAux:.defin...CovMatrixDiag._0
+    width <= 0 or a name that already fits is returned unchanged.
+    """
+    name = str(name)
+    if width <= 0 or len(name) <= width:
+        return name
+    if width <= 8:
+        return name[:width]
+    budget = width - 3                       # room for "..."
+    head = int(round(budget * 0.45))
+    tail = budget - head
+    return name[:head] + "..." + name[len(name) - tail:]
+
+
+def unique_short_names(names, width=None):
+    """
+    Shorten every name to about `width` characters such that no two DIFFERENT
+    names print the same. Names that still collide get more characters (in
+    steps) until they differ, up to their full length. Returns a list parallel
+    to `names`.
+    """
+    width = NAME_WIDTH if width is None else width
+    names = [str(n) for n in names]
+    if width <= 0:
+        return names
+    cur = {n: width for n in set(names)}
+    short = {n: shorten_name(n, w) for n, w in cur.items()}
+    while True:
+        groups = {}
+        for n, s in short.items():
+            groups.setdefault(s, []).append(n)
+        clashing = [g for g in groups.values() if len(g) > 1]
+        if not clashing:
+            break
+        grew = False
+        for g in clashing:
+            for n in g:
+                if cur[n] < len(n):
+                    cur[n] = min(len(n), cur[n] + 6)
+                    short[n] = shorten_name(n, cur[n])
+                    grew = True
+        if not grew:
+            break
+    return [short[n] for n in names]
+
+
 def _rows_from_dump(data, collection=None, prefix_names=False):
     """Flatten ONE collection dict (the old flat shape) into DataFrame rows."""
     data_type = data.get("type", "TTree")
@@ -520,11 +575,13 @@ def generate_mapping_report(offset_mapping, format_bytes,
     print_rntuple_suffix_explanation()
 
     print(f"{'Top 10 Branches/Fields by Reoperation Volume':<55}")
-    for i, (branch, count, reop_bytes) in enumerate(sorted_branches[:10]):
+    top10 = sorted_branches[:10]
+    top10_names = unique_short_names([b for b, _, _ in top10])
+    name_col = max([len(s) for s in top10_names] + [1])
+    for i, ((branch, count, reop_bytes), display) in enumerate(zip(top10, top10_names)):
         temporal = analyze_temporal_distribution(
             branch_cluster_indices[branch], total_clusters)
-        display = branch if len(branch) <= 50 else branch[:47] + "..."
-        print(f"  {i+1:2d}. {display:50s} : "
+        print(f"  {i+1:2d}. {display:{name_col}s} : "
               f"{format_bytes(reop_bytes, None):>10s} ({count:3d} hits, {temporal})")
 
     print("\nTemporal Pattern Legend:")
@@ -837,7 +894,8 @@ def plot_branch_reoperation_bytes(offset_mapping, format_bytes, output_prefix="o
     
     branch_names = [item[0] for item in branches_to_plot]
     reop_bytes = [item[1] for item in branches_to_plot]
-    display_names = [n[:50] + "..." if len(n) > 50 else n for n in branch_names]
+    display_names = unique_short_names(branch_names,
+                                       width=min(NAME_WIDTH, 50) if NAME_WIDTH > 0 else 0)
     
     fig_height = max(2.5, 1 + 0.3 * len(display_names))
     fig, ax = plt.subplots(figsize=(8, fig_height))
@@ -1098,11 +1156,13 @@ def setup_parser(parser: argparse.ArgumentParser):
     )
     parser.add_argument(
         "--heatmap_scope",
-        choices=["combined", "same_thread"],
-        default="combined",
-        help="combined: a reread is any overlap with ANY earlier read, attributed "
-             "to the thread doing the reread. same_thread: only overlaps with "
-             "earlier reads of the same thread count (default: %(default)s).",
+        choices=["split", "combined", "same_thread"],
+        default="split",
+        help="split: every thread gets a same-thread row (bytes that thread read "
+             "before) and a cross-thread row (reread bytes that only OTHER threads "
+             "had read before). combined: one row per thread, a reread is any "
+             "overlap with ANY earlier read. same_thread: one row per thread, only "
+             "overlaps with the same thread's earlier reads (default: %(default)s).",
     )
     parser.add_argument(
         "--heatmap_highlight",
@@ -1125,6 +1185,61 @@ def setup_parser(parser: argparse.ArgumentParser):
              "accounts for at least this fraction of the cell's reread bytes "
              "(default: %(default)s).",
     )
+
+    # ---- printout / plot labels ----
+    parser.add_argument(
+        "--name_width",
+        type=int,
+        default=70,
+        help="Maximum width of branch/field names in the printed summaries, "
+             "heatmap legend and branch plots. Long names keep their start and "
+             "end ('Head...Tail'), and names that would still print identically "
+             "are shown with more characters until they differ. 0 = never "
+             "shorten (default: %(default)s).",
+    )
+
+
+def print_pthread_inventory(dict_list, mod):
+    """
+    List EVERY pthread that appears in the DXT module (all file records, reads
+    and writes), so the log always shows which threads exist, even when they
+    are not analysed separately. Silent for logs without pthread_id.
+    """
+    stats = {}
+    n_rec = 0
+    for _dict in dict_list:
+        seen_here = set()
+        for kind in ("read", "write"):
+            df = _dict.get(kind + "_segments")
+            if df is None or not len(df) or 'pthread_id' not in df.columns:
+                continue
+            df = df[df['pthread_id'].notna()]
+            if df.empty:
+                continue
+            g = df.groupby('pthread_id').agg(n=('length', 'size'), b=('length', 'sum'),
+                                             t0=('start_time', 'min'), t1=('end_time', 'max'))
+            for tid, r in g.iterrows():
+                s = stats.setdefault(int(tid), {'files': 0, 'read_n': 0, 'write_n': 0,
+                                                'read_b': 0, 'write_b': 0,
+                                                't0': float('inf'), 't1': float('-inf')})
+                s[kind + '_n'] += int(r['n'])
+                s[kind + '_b'] += int(r['b'])
+                s['t0'] = min(s['t0'], float(r['t0']))
+                s['t1'] = max(s['t1'], float(r['t1']))
+                if int(tid) not in seen_here:
+                    s['files'] += 1
+                    seen_here.add(int(tid))
+        n_rec += 1
+    if not stats:
+        return
+    print(f"\n=== All pthreads in {mod}: {len(stats)} thread(s) across {n_rec} file record(s) ===")
+    print(f"{'pthread_id':>20s} {'files':>6s} {'read segs':>10s} {'write segs':>11s} "
+          f"{'read bytes':>12s} {'write bytes':>12s} {'first (s)':>10s} {'last (s)':>10s}")
+    for tid, s in sorted(stats.items(), key=lambda kv: (-(kv[1]['read_n'] + kv[1]['write_n']), kv[0])):
+        print(f"{tid:>20d} {s['files']:>6d} {s['read_n']:>10d} {s['write_n']:>11d} "
+              f"{format_bytes(s['read_b'], None):>12s} {format_bytes(s['write_b'], None):>12s} "
+              f"{s['t0']:>10.3f} {s['t1']:>10.3f}")
+    print("=" * 40)
 
 
 def split_by_pthread(seg_df, thread_ids=None):
@@ -1233,15 +1348,110 @@ def _short_thread_labels(ids):
     return full
 
 
+def _covered_overlaps(covered, start, end):
+    """Overlaps of [start, end) with a sorted list of merged intervals."""
+    out = []
+    idx = max(bisect.bisect_left(covered, (start,)) - 1, 0)
+    while idx < len(covered):
+        s, e = covered[idx]
+        if s >= end:
+            break
+        if e <= start:
+            idx += 1
+            continue
+        out.append((max(start, s), min(end, e)))
+        idx += 1
+    return out
+
+
+def _covered_insert(covered, start, end):
+    """Insert [start, end) into a sorted list of merged intervals."""
+    new_int = (start, end)
+    pos = bisect.bisect_left(covered, new_int)
+    if pos > 0 and covered[pos - 1][1] >= start:
+        new_int = (covered[pos - 1][0], max(covered[pos - 1][1], end))
+        covered.pop(pos - 1)
+        pos -= 1
+    while pos < len(covered) and covered[pos][0] <= new_int[1]:
+        new_int = (new_int[0], max(new_int[1], covered[pos][1]))
+        covered.pop(pos)
+    covered.insert(pos, new_int)
+
+
+def _subtract_intervals(a, b):
+    """a minus b for two sorted lists of disjoint intervals."""
+    out, j = [], 0
+    for s, e in a:
+        while j < len(b) and b[j][1] <= s:
+            j += 1
+        cur, k = s, j
+        while k < len(b) and b[k][0] < e:
+            bs, be = b[k]
+            if bs > cur:
+                out.append((cur, bs))
+            cur = max(cur, be)
+            k += 1
+        if cur < e:
+            out.append((cur, e))
+    return out
+
+
+def compute_split_reread_chunks(seg_df):
+    """
+    One pass over the events in order, tracking the bytes read so far by ALL
+    threads and by each thread separately. For every event the reread bytes
+    (overlap with anything read before) are split into
+        kind 0 'same'  : bytes this thread had already read itself
+        kind 1 'cross' : bytes that ONLY other threads had read before
+    so same + cross == the combined reread of compute_reoperation_bytes.
+    Returns chunk arrays {'time','tid','start','end','kind'}.
+    """
+    starts = seg_df['offset'].values.astype(np.int64)
+    ends   = starts + seg_df['length'].values.astype(np.int64)
+    times  = seg_df['start_time'].values
+    tids   = seg_df['pthread_id'].fillna(0).values
+    cov_all, cov_thr = [], {}
+    ch_time, ch_tid, ch_start, ch_end, ch_kind = [], [], [], [], []
+    for i in range(len(starts)):
+        s, e = int(starts[i]), int(ends[i])
+        cov_t = cov_thr.setdefault(int(tids[i]), [])
+        allo = _covered_overlaps(cov_all, s, e)
+        if allo:
+            samo = _covered_overlaps(cov_t, s, e)
+            crosso = _subtract_intervals(allo, samo) if samo else allo
+            for kind, lst in ((0, samo), (1, crosso)):
+                for a, b in lst:
+                    ch_time.append(times[i]); ch_tid.append(tids[i])
+                    ch_start.append(a); ch_end.append(b); ch_kind.append(kind)
+        _covered_insert(cov_all, s, e)
+        _covered_insert(cov_t, s, e)
+    return {
+        'time':  np.asarray(ch_time, dtype=float),
+        'tid':   np.asarray(ch_tid, dtype=tids.dtype),
+        'start': np.asarray(ch_start, dtype=np.int64),
+        'end':   np.asarray(ch_end, dtype=np.int64),
+        'kind':  np.asarray(ch_kind, dtype=np.int64),
+    }
+
+
 def collect_reread_chunks(seg_df, scope="combined", thread_ids=None):
     """
     Return the per-reread chunk arrays {'time','tid','start','end'}.
+      split        : like combined, but every reread chunk is tagged 'same'
+                    (the thread read those bytes before) or 'cross' (only other
+                    threads read them before); same + cross == combined.
       combined    : overlap with ANY earlier read, attributed to the thread
                     that issued the later read.
       same_thread : overlap only with earlier reads of the same thread.
     Reuses the chunks recorded by a previous compute_reoperation_bytes(...,
     collect_chunks=True) call when available, otherwise recomputes them.
     """
+    if scope == "split":
+        chunks = compute_split_reread_chunks(seg_df)
+        if thread_ids:
+            keep = np.isin(chunks['tid'], np.asarray(list(thread_ids), dtype=chunks['tid'].dtype))
+            chunks = {k: v[keep] for k, v in chunks.items()}
+        return chunks
     if scope == "same_thread":
         groups = split_by_pthread(seg_df, thread_ids) or {}
         parts = []
@@ -1312,10 +1522,12 @@ _HIGHLIGHT_COLORS = ['#1f77b4', '#2ca02c', '#9467bd', '#17becf',
 
 def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
                          op="operation", nbins=200, top_k=5, highlight="branch",
-                         threshold=0.5, max_threads=32, agg="sum"):
+                         threshold=0.5, max_threads=32, agg="sum", all_tids=None):
     """
     Summary heatmap of rereads per pthread over time, with top branches or
     clusters highlighted. Writes <prefix>_pthread_heatmap.png/.json.
+    all_tids: every pthread_id present in the record, so threads that never
+    reread anything still get a (empty) row and appear in the printed table.
     """
     from matplotlib.collections import PatchCollection
     from matplotlib.patches import Rectangle, Patch
@@ -1339,8 +1551,11 @@ def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
     tb    = np.clip(np.searchsorted(edges, t, side='right') - 1, 0, nbins - 1)
 
     # ---- thread rows: busiest first, the rest merged into 'other' --------
-    uniq, inv = np.unique(tid, return_inverse=True)
-    inv = np.asarray(inv).ravel()
+    uniq_src = tid
+    if all_tids is not None and len(all_tids):
+        uniq_src = np.concatenate([tid, np.asarray(all_tids).astype(tid.dtype)])
+    uniq = np.unique(uniq_src)
+    inv = np.searchsorted(uniq, tid)
     totals = np.bincount(inv, weights=size, minlength=len(uniq))
     order  = np.argsort(-totals, kind='stable')
     n_keep = len(uniq) if max_threads <= 0 else min(max_threads, len(uniq))
@@ -1353,6 +1568,23 @@ def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
     labels = _short_thread_labels(row_ids)
     if has_other:
         labels.append(f"other ({len(uniq) - n_keep} threads)")
+
+    # per-thread reread bytes for the printed table / JSON (all threads, incl. merged ones)
+    split = 'kind' in chunks
+    if split:
+        kind_arr = np.asarray(chunks['kind'], dtype=np.int64)
+        same_u  = np.bincount(inv, weights=size * (kind_arr == 0), minlength=len(uniq))
+        cross_u = np.bincount(inv, weights=size * (kind_arr == 1), minlength=len(uniq))
+    else:
+        same_u, cross_u = totals, None
+    thread_labels = list(labels)
+
+    # split mode: a second block of rows (same block order) for cross-thread rereads
+    nrows_t = nrows
+    if split:
+        rows = rows + np.asarray(chunks['kind'], dtype=np.int64) * nrows_t
+        nrows = 2 * nrows_t
+        labels = [f"{l} · same" for l in labels] + [f"{l} · cross" for l in labels]
 
     # ---- matrices --------------------------------------------------------
     ncell = nrows * nbins
@@ -1411,7 +1643,7 @@ def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
         vmin = vmax / 10.0
     norm = LogNorm(vmin=vmin, vmax=vmax)
 
-    fig_h = float(min(16, max(6.5, 3.0 + 0.30 * nrows)))
+    fig_h = float(min(18, max(6.5, 3.0 + 0.28 * nrows)))
     fig = plt.figure(figsize=(14, fig_h))
     gs = fig.add_gridspec(2, 3, width_ratios=[16, 2.6, 0.4], height_ratios=[2.2, 6],
                           hspace=0.05, wspace=0.05)
@@ -1428,6 +1660,9 @@ def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
     ax.set_yticklabels(labels, fontsize=9)
     ax.set_ylabel("pthread_id")
     ax.set_xlabel("Start time (s)")
+
+    if split:
+        ax.axhline(nrows_t, color="black", linewidth=1.5)     # same-thread block above, cross-thread below
 
     lw = 1.6 if nbins <= 100 else 1.0
     highlighted_cells = []
@@ -1462,7 +1697,8 @@ def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
     axt.tick_params(labelbottom=False, labelsize=8)
     axt.yaxis.set_major_locator(ticker.MaxNLocator(nbins=4, steps=[1, 2, 4, 8, 10]))
     axt.yaxis.set_major_formatter(ticker.FuncFormatter(format_bytes))
-    axt.set_title(f"Reread size per pthread over time ({op.capitalize()})",
+    axt.set_title(f"Reread size per pthread over time ({op.capitalize()})"
+                  + ("  -  same-thread rows above the line, cross-thread rows below" if split else ""),
                   fontsize=11, fontweight="bold")
 
     # right marginal: per thread row, stacked by top branches/clusters
@@ -1482,7 +1718,9 @@ def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
     axr.set_xlabel("per thread", fontsize=8)
 
     if K:
-        handles = [Patch(fc="none", ec=colors[k], lw=1.8, label=top_keys[k]['name'][:48])
+        legend_names = unique_short_names([tk['name'] for tk in top_keys],
+                                          width=min(NAME_WIDTH, 48) if NAME_WIDTH > 0 else 0)
+        handles = [Patch(fc="none", ec=colors[k], lw=1.8, label=legend_names[k])
                    for k in range(K)]
         handles.append(Patch(fc="#bbbbbb", label="other / unmapped"))
         ax.legend(handles=handles,
@@ -1501,8 +1739,20 @@ def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
         "threshold": threshold,
         "highlight": highlight if K else "none",
         "time_edges": [float(x) for x in edges],
-        "pthread_rows": [str(i) for i in row_ids] + (["other"] if has_other else []),
+        "scope": "split" if split else "single",
+        "pthread_rows": ([str(i) for i in row_ids] + (["other"] if has_other else [])) * (2 if split else 1),
+        "row_kind": (["same"] * nrows_t + ["cross"] * nrows_t) if split else None,
         "pthread_labels": labels,
+        "all_pthread_ids": [str(int(u)) for u in uniq],
+        "other_pthread_ids": [str(int(uniq[i])) for i in order[n_keep:]],
+        "per_pthread_reread_bytes": [
+            {"pthread_id": str(int(uniq[i])),
+             "row": thread_labels[r] if r < n_keep else thread_labels[-1],
+             "same_thread_bytes": int(same_u[i]),
+             "cross_thread_bytes": None if cross_u is None else int(cross_u[i]),
+             "total_bytes": int(totals[i])}
+            for r, i in enumerate(order)
+        ],
         "cell_sum_bytes": [[int(v) for v in r] for r in S],
         "cell_value": [[int(v) for v in r] for r in M],
         "top": [
@@ -1515,9 +1765,35 @@ def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
         json.dump(out, f, indent=2)
 
     print(f"pthread heatmap saved to {png}  ({nrows} rows x {nbins} time bins)")
-    for k in range(K):
-        print(f"  {k + 1}. {top_keys[k]['name'][:50]:50s} {format_bytes(top_keys[k]['bytes'], None):>10s}"
-              f"  outlined cells: {len(highlighted_cells[k])}")
+
+    if K:
+        names_p = unique_short_names([tk['name'] for tk in top_keys])
+        col = max(len(s) for s in names_p)
+        for k in range(K):
+            print(f"  {k + 1}. {names_p[k]:{col}s} {format_bytes(top_keys[k]['bytes'], None):>10s}"
+                  f"  outlined cells: {len(highlighted_cells[k])}")
+
+    # every pthread in the record, busiest first, with the full id behind each row label
+    print(f"\n  All {len(uniq)} pthreads in this record "
+          f"(heatmap row label -> full pthread_id; reread bytes {op}):")
+    hdr = f"    {'row':>26s}  {'pthread_id':>20s}  "
+    hdr += (f"{'same-thread':>12s}  {'cross-thread':>12s}  {'total':>12s}" if split
+            else f"{'reread':>12s}")
+    print(hdr)
+    for r, i in enumerate(order):
+        row_lab = thread_labels[r] if r < n_keep else thread_labels[-1]
+        line = f"    {row_lab:>26s}  {int(uniq[i]):>20d}  "
+        if split:
+            line += (f"{format_bytes(same_u[i], None):>12s}  "
+                     f"{format_bytes(cross_u[i], None):>12s}  "
+                     f"{format_bytes(totals[i], None):>12s}")
+        else:
+            line += f"{format_bytes(totals[i], None):>12s}"
+        print(line)
+    if has_other:
+        print(f"    (threads on the '{thread_labels[-1]}' row are the last "
+              f"{len(uniq) - n_keep} entries above; raise --heatmap_max_threads "
+              f"or use 0 to give each its own row)")
 
 
 def run_pthread_heatmap(seg_df, output_prefix, args, tree_branch_df, op):
@@ -1533,10 +1809,14 @@ def run_pthread_heatmap(seg_df, output_prefix, args, tree_branch_df, op):
               "to highlight branches/clusters; drawing the heatmap without highlights.")
         highlight = "none"
     chunks = collect_reread_chunks(seg_df, args.heatmap_scope, args.pthread_ids)
+    all_tids = seg_df['pthread_id'].dropna().unique()
+    if args.pthread_ids:
+        all_tids = [t for t in all_tids if int(t) in set(int(x) for x in args.pthread_ids)]
     plot_pthread_heatmap(chunks, tree_branch_df, output_prefix=output_prefix, op=op,
                          nbins=args.heatmap_bins, top_k=args.heatmap_top_k,
                          highlight=highlight, threshold=args.heatmap_threshold,
-                         max_threads=args.heatmap_max_threads, agg=args.heatmap_agg)
+                         max_threads=args.heatmap_max_threads, agg=args.heatmap_agg,
+                         all_tids=all_tids)
 
 
 def main(args: Union[Any, None] = None):
@@ -1584,6 +1864,9 @@ def main(args: Union[Any, None] = None):
               f"Available modules in this log: {list(report.records.keys())}\n")
         sys.exit(1)
     dict_list = report.records[mod].to_df()
+    global NAME_WIDTH
+    NAME_WIDTH = getattr(args, 'name_width', NAME_WIDTH)
+    print_pthread_inventory(dict_list, mod)
     seg_key = op + "_segments"
     want_heatmap = bool(args.pthread_heatmap) and not args.no_plotting
     for idx, _dict in enumerate(dict_list):
