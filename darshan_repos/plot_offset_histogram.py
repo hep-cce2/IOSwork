@@ -3,6 +3,10 @@ import argparse
 import bisect
 from typing import Any, Union
 import json
+import os
+import io
+from contextlib import redirect_stdout, redirect_stderr, ExitStack
+from concurrent.futures import ProcessPoolExecutor
 
 import darshan
 
@@ -1106,6 +1110,19 @@ def setup_parser(parser: argparse.ArgumentParser):
         help="Number of top branches/Fields to plot (default (all): -1)."
     )
 
+    parser.add_argument(
+        "--log_file", type=str, default=None,
+        help="Unified main log path. In per_thread mode defaults to "
+             "<output_prefix>_main.log (or <input_log_stem>_main.log). "
+             "All pthread logs, summaries, and heatmap output go here in order.",
+    )
+
+    parser.add_argument(
+        "--pthread_workers", type=int, default=0,
+        help="Worker processes for per_thread mode (0 = automatic, 1 = sequential). "
+             "Worker log output is replayed in pthread order (default: %(default)s).",
+    )
+
     # ---- per-pthread analysis (new DXT format with pthread_id) ----
     parser.add_argument(
         "--pthread_mode",
@@ -1303,6 +1320,34 @@ def process_segments(seg_df, output_prefix, args, tree_branch_df, op, collect_ch
     total = int(seg_df['reoperation'].sum())
     print(f"total overlapped bytes for {op}: ", total)
     return total
+
+
+# One read-only reference per worker rather than serializing a 250k+ row
+# ROOT mapping DataFrame with every pthread task.
+_THREAD_ARGS = None
+_THREAD_TREE_DF = None
+_THREAD_OP = None
+_THREAD_PREFIX = None
+
+
+def _init_pthread_worker(args, tree_branch_df, op, prefix, name_width):
+    global _THREAD_ARGS, _THREAD_TREE_DF, _THREAD_OP, _THREAD_PREFIX, NAME_WIDTH
+    _THREAD_ARGS = args
+    _THREAD_TREE_DF = tree_branch_df
+    _THREAD_OP = op
+    _THREAD_PREFIX = prefix
+    NAME_WIDTH = name_width
+
+
+def _process_pthread_worker(task):
+    """Return one thread's statistics and buffered log, with no interleaved output."""
+    tid, tdf = task
+    captured = io.StringIO()
+    with redirect_stdout(captured), redirect_stderr(captured):
+        print(f"\n########## pthread_id {tid}: {len(tdf)} {_THREAD_OP} segments ##########")
+        total = process_segments(tdf, f"{_THREAD_PREFIX}_tid{tid}",
+                                 _THREAD_ARGS, _THREAD_TREE_DF, _THREAD_OP)
+    return tid, int(len(tdf)), total, captured.getvalue()
 
 
 def print_pthread_summary(op, per_thread_stats, combined_total):
@@ -1912,7 +1957,7 @@ def run_pthread_heatmap(seg_df, output_prefix, args, tree_branch_df, op):
                          all_tids=all_tids, scope=args.heatmap_scope)
 
 
-def main(args: Union[Any, None] = None):
+def _run_main(args: Union[Any, None] = None):
     """
     Generates Plots and Statistics for Duplicate Read/Write Events in DXT records
     """
@@ -1991,11 +2036,33 @@ def main(args: Union[Any, None] = None):
                     combined_total = int(tmp['reoperation'].sum())
 
                 per_thread_stats = {}
-                for tid, tdf in groups.items():
-                    print(f"\n########## pthread_id {tid}: {len(tdf)} {op} segments ##########")
-                    total = process_segments(tdf, f"{output_prefix}_tid{tid}",
-                                             args, tree_branch_df, op)
-                    per_thread_stats[tid] = {"segments": int(len(tdf)), "reop": total}
+                workers = getattr(args, 'pthread_workers', 0)
+                if workers < 0:
+                    raise ValueError("--pthread_workers must be non-negative")
+                workers = min(len(groups), workers or (os.cpu_count() or 1))
+
+                if workers == 1:
+                    # Preserve original direct printing when there is no parallelism.
+                    for tid, tdf in groups.items():
+                        print(f"\n########## pthread_id {tid}: {len(tdf)} {op} segments ##########")
+                        total = process_segments(tdf, f"{output_prefix}_tid{tid}",
+                                                 args, tree_branch_df, op)
+                        per_thread_stats[tid] = {"segments": int(len(tdf)), "reop": total}
+                else:
+                    # executor.map yields results in submission/pthread order, even if
+                    # jobs finish out of order. Only the parent writes the console log.
+                    # Each child uses a unique per-pthread filename prefix.
+                    with ProcessPoolExecutor(
+                        max_workers=workers,
+                        initializer=_init_pthread_worker,
+                        initargs=(args, tree_branch_df, op, output_prefix, NAME_WIDTH),
+                    ) as pool:
+                        for tid, nsegments, total, thread_log in pool.map(
+                            _process_pthread_worker, groups.items()
+                        ):
+                            sys.stdout.write(thread_log)
+                            sys.stdout.flush()
+                            per_thread_stats[tid] = {"segments": nsegments, "reop": total}
 
                 summary = print_pthread_summary(op, per_thread_stats, combined_total)
                 with open(f"{output_prefix}_pthread_summary.json", "w") as f:
@@ -2010,6 +2077,47 @@ def main(args: Union[Any, None] = None):
 
         if want_heatmap:
             run_pthread_heatmap(seg_df, output_prefix, args, tree_branch_df, op)
+
+
+class _TeeStream:
+    """Print to the terminal and the unified log at the same time."""
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text):
+        for stream in self.streams:
+            stream.write(text)
+        return len(text)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
+def main(args: Union[Any, None] = None):
+    """Run analysis with one organized main log (including worker output)."""
+    if args is None:
+        parser = argparse.ArgumentParser(description="")
+        setup_parser(parser)
+        args = parser.parse_args()
+
+    log_file = getattr(args, 'log_file', None)
+    if log_file is None and args.pthread_mode == 'per_thread':
+        prefix = args.output_prefix or os.path.splitext(os.path.basename(args.log_path))[0]
+        log_file = f"{prefix}_main.log"
+
+    if not log_file:
+        return _run_main(args)
+
+    # Workers return their buffered text; only this parent process writes the
+    # unified log. This avoids interleaving, even when workers finish out of order.
+    directory = os.path.dirname(os.path.abspath(log_file))
+    os.makedirs(directory, exist_ok=True)
+    with open(log_file, 'w', encoding='utf-8', buffering=1) as log_handle:
+        with redirect_stdout(_TeeStream(sys.stdout, log_handle)), \
+             redirect_stderr(_TeeStream(sys.stderr, log_handle)):
+            print(f"Main analysis log: {log_file}")
+            return _run_main(args)
 
 
 if __name__ == "__main__":
