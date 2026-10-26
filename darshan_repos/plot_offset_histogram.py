@@ -1515,6 +1515,40 @@ def _attribute_chunks_to_keys(cs, ce, tree_branch_df, key_col):
             np.concatenate(m_bytes), list(names))
 
 
+def format_bytes_axis(y, pos=None):
+    """Compact byte label for plot axes: 0B, 512B, 1.5KB, 128GB (never '195,312,500KB')."""
+    y = float(y)
+    if y == 0:
+        return "0B"
+    units = ("B", "KB", "MB", "GB", "TB", "PB")
+    i = 0
+    while abs(y) >= 1024 and i < len(units) - 1:
+        y /= 1024.0
+        i += 1
+    s = f"{y:.0f}" if (abs(y - round(y)) < 0.05 or abs(y) >= 100) else f"{y:.1f}"
+    return f"{s}{units[i]}"
+
+
+def _set_byte_axis(axis, set_lim, vmax, n=3):
+    """
+    Linear 0..vmax byte axis (axis = ax.xaxis / ax.yaxis, set_lim = ax.set_xlim /
+    ax.set_ylim) with at most ~n binary-friendly ticks: 0, 128MB, 256MB, ...
+    """
+    axis.set_major_formatter(ticker.FuncFormatter(format_bytes_axis))
+    if not np.isfinite(vmax) or vmax <= 0:
+        set_lim(0, 1)
+        axis.set_major_locator(ticker.FixedLocator([0]))
+        return
+    unit = 1024.0 ** int(np.floor(np.log(vmax) / np.log(1024.0)))
+    step = unit
+    for m in (2.0 ** e for e in range(-8, 12)):
+        step = m * unit
+        if vmax / step <= n:
+            break
+    set_lim(0, vmax * 1.05)
+    axis.set_major_locator(ticker.FixedLocator(np.arange(0, vmax * 1.001, step)))
+
+
 # outline colors avoid red/orange/yellow so they stay visible on the YlOrRd cells
 _HIGHLIGHT_COLORS = ['#1f77b4', '#2ca02c', '#9467bd', '#17becf',
                      '#8c564b', '#e377c2', '#003f5c', '#4d4d4d']
@@ -1648,9 +1682,21 @@ def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
     gs = fig.add_gridspec(2, 3, width_ratios=[16, 2.6, 0.4], height_ratios=[2.2, 6],
                           hspace=0.05, wspace=0.05)
     ax  = fig.add_subplot(gs[1, 0])
-    axt = fig.add_subplot(gs[0, 0], sharex=ax)
-    axr = fig.add_subplot(gs[1, 1], sharey=ax)
     cax = fig.add_subplot(gs[1, 2])
+    if split:
+        # one marginal per block, each with its OWN scale: cross-thread rereads are
+        # often orders of magnitude smaller than same-thread ones and would
+        # otherwise vanish next to them. The two right-hand axes split the column
+        # in half, matching the two equal row blocks of the heatmap.
+        gt = gs[0, 0].subgridspec(2, 1, hspace=0.18)
+        axt_list = [fig.add_subplot(gt[i], sharex=ax) for i in range(2)]
+        gr = gs[1, 1].subgridspec(2, 1, hspace=0.0)
+        axr_list = [fig.add_subplot(gr[i]) for i in range(2)]
+        blocks = [(slice(0, nrows_t), "same-thread"), (slice(nrows_t, nrows), "cross-thread")]
+    else:
+        axt_list = [fig.add_subplot(gs[0, 0], sharex=ax)]
+        axr_list = [fig.add_subplot(gs[1, 1], sharey=ax)]
+        blocks = [(slice(0, nrows), None)]
 
     mesh = ax.pcolormesh(edges, np.arange(nrows + 1), np.ma.masked_less_equal(M, 0),
                          cmap="YlOrRd", norm=norm, shading='flat')
@@ -1684,38 +1730,45 @@ def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
 
     # top marginal: per time bin, stacked by top branches/clusters
     centers = (edges[:-1] + edges[1:]) / 2
-    per_time_total = S.sum(axis=0)
-    bottom = np.zeros(nbins)
-    for k in range(K):
-        v = contrib[k].sum(axis=0)
-        axt.bar(centers, v, bottom=bottom, width=dt, color=colors[k], linewidth=0)
-        bottom += v
-    other_t = np.clip(per_time_total - bottom, 0, None)
-    axt.bar(centers, other_t, bottom=bottom, width=dt,
-            color="#bbbbbb" if K else "steelblue", linewidth=0)
-    axt.set_ylabel("per time bin", fontsize=8)
-    axt.tick_params(labelbottom=False, labelsize=8)
-    axt.yaxis.set_major_locator(ticker.MaxNLocator(nbins=4, steps=[1, 2, 4, 8, 10]))
-    axt.yaxis.set_major_formatter(ticker.FuncFormatter(format_bytes))
-    axt.set_title(f"Reread size per pthread over time ({op.capitalize()})"
-                  + ("  -  same-thread rows above the line, cross-thread rows below" if split else ""),
-                  fontsize=11, fontweight="bold")
+    rest_color = "#bbbbbb" if K else "steelblue"
+    for axt_b, (sl, bname) in zip(axt_list, blocks):
+        per_time_total = S[sl].sum(axis=0)
+        bottom = np.zeros(nbins)
+        for k in range(K):
+            v = contrib[k][sl].sum(axis=0)
+            axt_b.bar(centers, v, bottom=bottom, width=dt, color=colors[k], linewidth=0)
+            bottom += v
+        other_t = np.clip(per_time_total - bottom, 0, None)
+        axt_b.bar(centers, other_t, bottom=bottom, width=dt, color=rest_color, linewidth=0)
+        axt_b.set_ylabel(bname or "per time bin", fontsize=8)
+        axt_b.tick_params(labelbottom=False, labelsize=8)
+        _set_byte_axis(axt_b.yaxis, axt_b.set_ylim, float(per_time_total.max()), 3)
+    axt_list[0].set_title(f"Reread size per pthread over time ({op.capitalize()})"
+                          + ("  -  same-thread rows above the line, cross-thread rows below" if split else ""),
+                          fontsize=11, fontweight="bold")
 
     # right marginal: per thread row, stacked by top branches/clusters
-    ypos = np.arange(nrows) + 0.5
-    per_thread_total = S.sum(axis=1)
-    left = np.zeros(nrows)
-    for k in range(K):
-        v = contrib[k].sum(axis=1)
-        axr.barh(ypos, v, left=left, height=1, color=colors[k], linewidth=0)
-        left += v
-    other_r = np.clip(per_thread_total - left, 0, None)
-    axr.barh(ypos, other_r, left=left, height=1,
-             color="#bbbbbb" if K else "steelblue", linewidth=0)
-    axr.tick_params(labelleft=False, labelsize=8)
-    axr.xaxis.set_major_formatter(ticker.FuncFormatter(format_bytes))
-    axr.xaxis.set_major_locator(ticker.MaxNLocator(nbins=3, steps=[1, 2, 4, 8, 10]))
-    axr.set_xlabel("per thread", fontsize=8)
+    for j, (axr_b, (sl, bname)) in enumerate(zip(axr_list, blocks)):
+        ypos = np.arange(sl.start, sl.stop) + 0.5
+        row_total = S[sl].sum(axis=1)
+        left = np.zeros(len(ypos))
+        for k in range(K):
+            v = contrib[k][sl].sum(axis=1)
+            axr_b.barh(ypos, v, left=left, height=1, color=colors[k], linewidth=0)
+            left += v
+        other_r = np.clip(row_total - left, 0, None)
+        axr_b.barh(ypos, other_r, left=left, height=1, color=rest_color, linewidth=0)
+        axr_b.tick_params(labelleft=False, labelsize=7 if split else 8)
+        _set_byte_axis(axr_b.xaxis, axr_b.set_xlim, float(row_total.max()), 2)
+        if split:
+            axr_b.set_ylim(sl.stop, sl.start)          # same row order/direction as the heatmap
+            axr_b.text(0.97, 0.02, bname, transform=axr_b.transAxes, ha='right', va='bottom',
+                       fontsize=7, color='0.2',
+                       bbox=dict(fc='white', ec='none', alpha=0.75, pad=1.5))
+            if j == 0:
+                axr_b.xaxis.tick_top()                 # keep the two scales' labels apart
+        else:
+            axr_b.set_xlabel("per thread", fontsize=8)
 
     if K:
         legend_names = unique_short_names([tk['name'] for tk in top_keys],
