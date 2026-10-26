@@ -1725,7 +1725,7 @@ def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
     ax.set_xlim(edges[0], edges[-1])
     ax.set_ylim(nrows, 0)
     ax.set_yticks(np.arange(nrows) + 0.5)
-    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_yticklabels([f"{n + 1}  {lab}" for n, lab in enumerate(labels)], fontsize=9)   # row number first
     ax.set_ylabel("pthread_id")
     ax.set_xlabel("Start time (s)")
 
@@ -1823,6 +1823,8 @@ def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
         "per_pthread_reread_bytes": [
             {"pthread_id": str(int(uniq[i])),
              "row": thread_labels[r] if r < n_keep else thread_labels[-1],
+             "same_row_number": (r if r < n_keep else n_keep) + 1,
+             "cross_row_number": None if not split else nrows_t + (r if r < n_keep else n_keep) + 1,
              "same_thread_bytes": int(same_u[i]),
              "cross_thread_bytes": None if cross_u is None else int(cross_u[i]),
              "total_bytes": int(totals[i])}
@@ -1850,16 +1852,31 @@ def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
 
     print_reread_definitions(scope or ("split" if split else "combined"))
 
-    # every pthread in the record, busiest first, with the full id behind each row label
-    print(f"\n  All {len(uniq)} pthreads in this record "
-          f"(heatmap row label -> full pthread_id; reread bytes {op}):")
-    hdr = f"    {'row':>26s}  {'pthread_id':>20s}  "
+    # every pthread in the record, busiest first, with the heatmap row number(s) it is drawn on
+    N = nrows_t
+    print(f"\n  All {len(uniq)} pthreads in this record (reread bytes, {op}):")
+    print("  'row' = the row number on the heatmap, counted from the top of the plot starting at 1;")
+    print("  the same number starts each y-axis label in the figure.")
+    if split:
+        print(f"    {'rows 1-' + str(N):<16s}: same-thread rows, one per thread (busiest thread first)")
+        print(f"    {'rows ' + str(N + 1) + '-' + str(2 * N):<16s}: cross-thread rows, same thread order "
+              f"(a thread on same-thread row k has its cross-thread row at k + {N})")
+    else:
+        print(f"    {'rows 1-' + str(N):<16s}: one row per thread (busiest thread first)")
+    if has_other:
+        print(f"    '*' = this thread is merged into the last row of its block, "
+              f"'{thread_labels[-1]}'")
+    hdr = f"    {'same row':>9s}  " + (f"{'cross row':>9s}  " if split else "") + f"{'pthread_id':>20s}  "
     hdr += (f"{'same-thread':>12s}  {'cross-thread':>12s}  {'total':>12s}" if split
             else f"{'reread':>12s}")
-    print(hdr)
+    print(hdr.replace("same row", "row" if not split else "same row"))
     for r, i in enumerate(order):
-        row_lab = thread_labels[r] if r < n_keep else thread_labels[-1]
-        line = f"    {row_lab:>26s}  {int(uniq[i]):>20d}  "
+        ridx = r if r < n_keep else n_keep                    # 0-based row within its block
+        star = "*" if r >= n_keep else ""
+        line = f"    {str(ridx + 1) + star:>9s}  "
+        if split:
+            line += f"{str(N + ridx + 1) + star:>9s}  "
+        line += f"{int(uniq[i]):>20d}  "
         if split:
             line += (f"{format_bytes(same_u[i], None):>12s}  "
                      f"{format_bytes(cross_u[i], None):>12s}  "
@@ -1868,9 +1885,8 @@ def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
             line += f"{format_bytes(totals[i], None):>12s}"
         print(line)
     if has_other:
-        print(f"    (threads on the '{thread_labels[-1]}' row are the last "
-              f"{len(uniq) - n_keep} entries above; raise --heatmap_max_threads "
-              f"or use 0 to give each its own row)")
+        print(f"    ({len(uniq) - n_keep} threads share the '{thread_labels[-1]}' row; raise "
+              f"--heatmap_max_threads, or use 0, to give each its own row)")
 
 
 def run_pthread_heatmap(seg_df, output_prefix, args, tree_branch_df, op):
