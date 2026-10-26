@@ -1,6 +1,7 @@
 import sys
 import argparse
 import bisect
+import math
 from typing import Any, Union
 import json
 import os
@@ -847,7 +848,7 @@ def plot_reoperation_offsets_over_time(df, output_prefix="output", op="operation
     plt.close(fig)
 
 
-def plot_branch_reoperation_bytes(offset_mapping, format_bytes, output_prefix="output", op="operation", top_n=-1, tree_branch_df=None): 
+def plot_branch_reoperation_bytes(offset_mapping, format_bytes, output_prefix="output", op="operation", top_n=-1, tree_branch_df=None, physical_reop_bytes=None, create_plot=True): 
     """
     Generates and saves a bar plot of reoperation bytes per branch/field.
     Uses corrected intersection attribution logic.
@@ -869,23 +870,57 @@ def plot_branch_reoperation_bytes(offset_mapping, format_bytes, output_prefix="o
         print(f"No branch reoperation data found to plot for {op}.")
         return
     
-    # 1. Sort and Filter
-    non_empty_branches = [(name, bytes_val) for name, bytes_val in branch_reoperation_bytes.items() if bytes_val > 0]
+    # Use all active branches for JSON, independently of --top_n_plot.
+    non_empty_branches = [(name, int(value)) for name, value in branch_reoperation_bytes.items() if value > 0]
     total_non_empty = len(non_empty_branches)
-    
-    is_cluster_mode = non_empty_branches[0][0].startswith("cluster_")
+    if not non_empty_branches:
+        print(f"No positive branch reoperation data found for {op}.")
+        return
+    stats_branches = sorted(non_empty_branches, key=lambda item: (-item[1], item[0]))
+    # Distinguish physical rereads from their attribution to ROOT entries.
+    # An offset with no matches, partially covered offsets, or overlapping
+    # ROOT byte intervals can make these totals differ.
+    mapped_offset_total = math.fsum(
+        int(matches[0]['total_reop_bytes'])
+        for matches in offset_mapping.values() if matches
+    )
+    attributed_total = math.fsum(value for _, value in stats_branches)
+    stats = {
+        "operation": op,
+        "total_branches": total_all_branches,
+        "non_zero_branches": total_non_empty,
+        "total_reop_bytes": int(attributed_total),  # Legacy: ROOT-attributed sum, NOT physical total.
+        "total_reop_bytes_meaning": "sum of proportional branch/page attributions (may differ from physical rereads)",
+        "physical_reop_bytes": None if physical_reop_bytes is None else int(physical_reop_bytes),
+        "mapped_offset_input_bytes": int(mapped_offset_total),
+        "attributed_minus_mapped_offset_bytes": attributed_total - mapped_offset_total,
+        "attributed_to_physical_ratio": (
+            attributed_total / physical_reop_bytes if physical_reop_bytes else None
+        ),
+        "branches": [{"name": name, "bytes": value} for name, value in stats_branches],
+    }
+    if physical_reop_bytes is not None and not math.isclose(
+        attributed_total, physical_reop_bytes, rel_tol=1e-8, abs_tol=1
+    ):
+        print("Warning: ROOT-attributed bytes do not equal physical reread bytes: "
+              f"{attributed_total:.3f} vs {physical_reop_bytes}. "
+              "Unmapped byte ranges, overlapping metadata ranges, and/or "
+              "collapsed offset intervals may contribute.")
+    with open(f"{output_prefix}_branch_statistics.json", 'w') as f:
+        json.dump(stats, f, indent=2)
 
-    if is_cluster_mode:
-        non_empty_branches.sort(key=lambda x: int(x[0].split('_')[1]))
+    if not create_plot:
+        return
 
-    if top_n != -1 or not is_cluster_mode:
-        non_empty_branches.sort(key=lambda x: x[1], reverse=True)
-    
-    # 2. Apply Top N Slicing
-    if top_n != -1:
-        branches_to_plot = non_empty_branches[:top_n]
+    is_cluster_mode = all(name.startswith("cluster_") for name, _ in non_empty_branches)
+    if top_n > 0:
+        branches_to_plot = stats_branches[:top_n]
+    elif is_cluster_mode:
+        branches_to_plot = sorted(non_empty_branches, key=lambda item: int(item[0].split('_')[1]))
     else:
-        branches_to_plot = non_empty_branches
+        branches_to_plot = list(stats_branches)
+    if not branches_to_plot:
+        return
 
     if is_cluster_mode:
         branches_to_plot.sort(key=lambda x: int(x[0].split('_')[1]))
@@ -980,16 +1015,6 @@ def plot_branch_reoperation_bytes(offset_mapping, format_bytes, output_prefix="o
     plt.close(fig)
     if top_n == -1 and is_cluster_mode: plt.close(fig1)
     
-    stats = {
-        "operation": op,
-        "total_branches": total_all_branches,
-        "non_zero_branches": total_non_empty,
-        "total_reop_bytes": int(sum(reop_bytes)),
-        "branches": [{"name": n, "bytes": b} for n, b in non_empty_branches[::-1]] 
-    }
-    with open(f"{output_prefix}_branch_statistics.json", 'w') as f:
-        json.dump(stats, f, indent=2)
-
     print(f"Summary: {total_non_empty} active branches found. Plot saved to {filename}")
 
 def setup_parser(parser: argparse.ArgumentParser):
@@ -1298,15 +1323,17 @@ def process_segments(seg_df, output_prefix, args, tree_branch_df, op, collect_ch
                                        top_bins=args.top_bins, top_events=args.top_events, op=op)
     if not args.no_plotting:
         plot_reoperation_offsets_over_time(seg_df, output_prefix=output_prefix, op=op)
-        if args.enable_mapping and offset_mapping:
-            plot_branch_reoperation_bytes(
-                offset_mapping,
-                format_bytes,
-                output_prefix=output_prefix + "_per_branch" if "per_branch" in args.tree_branch_file else output_prefix,
-                op=op,
-                tree_branch_df=tree_branch_df,
-                top_n=args.top_n_plot
-            )
+    if args.enable_mapping and offset_mapping:
+        plot_branch_reoperation_bytes(
+            offset_mapping,
+            format_bytes,
+            output_prefix=output_prefix + "_per_branch" if "per_branch" in args.tree_branch_file else output_prefix,
+            op=op,
+            tree_branch_df=tree_branch_df,
+            top_n=args.top_n_plot,
+            physical_reop_bytes=int(seg_df['reoperation'].sum()),
+            create_plot=not args.no_plotting,
+        )
 
     print(seg_df)
     print(args.time_sep)
