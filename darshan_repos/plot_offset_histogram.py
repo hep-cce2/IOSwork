@@ -313,9 +313,11 @@ def map_offsets_to_tree_branches(reop_data, tree_branch_df):
 
     for offset in offsets:
         info = reop_data[offset]
+        parts = None
         if isinstance(info, dict) and 'bytes' in info:
             total_reop_bytes = info['bytes']
             ov_end = info['end']
+            parts = info.get('parts')
         else:
             # Fallback if old structure
             total_reop_bytes = info
@@ -323,12 +325,24 @@ def map_offsets_to_tree_branches(reop_data, tree_branch_df):
 
         ov_start = offset
         matches  = []
-        
+
         # Vectorized check: does the reread interval intersect the branch?
         in_range = ((start_bytes < ov_end) & ((end_bytes) > ov_start))
         branch_indices = np.where(in_range)[0]
 
-        for branch_idx in branch_indices:
+        # Exact attribution: every group of rereads (same start, same end) is spread over
+        # ITS OWN [start, end) only. Spreading the summed bytes of all groups over the
+        # longest one would hand short rereads' bytes to branches they never touched.
+        attr_vec = None
+        if parts and len(branch_indices):
+            pe = np.fromiter(parts.keys(), dtype=np.float64, count=len(parts))
+            pb = np.fromiter(parts.values(), dtype=np.float64, count=len(parts))
+            inter = np.clip(np.minimum(pe[None, :], end_bytes[branch_indices][:, None].astype(np.float64))
+                            - np.maximum(float(ov_start), start_bytes[branch_indices][:, None].astype(np.float64)),
+                            0.0, None)
+            attr_vec = (inter * (pb / (pe - ov_start))[None, :]).sum(axis=1)
+
+        for k_match, branch_idx in enumerate(branch_indices):
             row        = tree_branch_df.iloc[branch_idx]
             b_start    = start_bytes[branch_idx]
             b_end      = end_bytes[branch_idx] # This is start + length
@@ -339,8 +353,11 @@ def map_offsets_to_tree_branches(reop_data, tree_branch_df):
             intersect_len   = max(0, intersect_end - intersect_start)
 
             # Attribute reoperation penalty proportionally to intersection size
-            ratio = intersect_len / (ov_end - ov_start) if (ov_end - ov_start) > 0 else 0
-            attributed_reop_bytes = total_reop_bytes * ratio
+            if attr_vec is not None:
+                attributed_reop_bytes = float(attr_vec[k_match])
+            else:
+                ratio = intersect_len / (ov_end - ov_start) if (ov_end - ov_start) > 0 else 0
+                attributed_reop_bytes = total_reop_bytes * ratio
 
             match = {
                 'collection':           str(row['Collection']) if 'Collection' in row.index else '',
@@ -657,9 +674,14 @@ def compute_reoperation_bytes(df, collect_chunks=False):
 
             # Store 'bytes' and 'end' safely to allow accurate range intersection mapping
             if ov_start not in offset_to_total_bytes:
-                offset_to_total_bytes[ov_start] = {'bytes': 0, 'end': ov_end}
+                offset_to_total_bytes[ov_start] = {'bytes': 0, 'end': ov_end, 'parts': {}}
             offset_to_total_bytes[ov_start]['bytes'] += overlap_amount
             offset_to_total_bytes[ov_start]['end'] = max(offset_to_total_bytes[ov_start]['end'], ov_end)
+            # Rereads that start at the same offset can end at different offsets (e.g. a
+            # 300 B reread and a 4 MB reread of the same region). Keep the bytes per end
+            # offset so the branch attribution can use each reread's own extent.
+            parts = offset_to_total_bytes[ov_start]['parts']
+            parts[ov_end] = parts.get(ov_end, 0) + overlap_amount
 
             if collect_chunks:
                 ch_time.append(start_times[i])
@@ -870,8 +892,14 @@ def plot_branch_reoperation_bytes(offset_mapping, format_bytes, output_prefix="o
         print(f"No branch reoperation data found to plot for {op}.")
         return
     
-    # Use all active branches for JSON, independently of --top_n_plot.
-    non_empty_branches = [(name, int(value)) for name, value in branch_reoperation_bytes.items() if value > 0]
+    # --top_n_plot: any value <= 0 means "all" (-1 is the documented default).
+    top_n = top_n if top_n and top_n > 0 else -1
+
+    # Use all active branches for JSON, independently of --top_n_plot. Totals are summed
+    # from the exact (float) attributions and only rounded for display: truncating each
+    # branch with int() dropped up to 1 byte per branch from the total.
+    non_empty_branches = [(name, int(round(value))) for name, value in branch_reoperation_bytes.items()
+                          if round(value) > 0]
     total_non_empty = len(non_empty_branches)
     if not non_empty_branches:
         print(f"No positive branch reoperation data found for {op}.")
@@ -884,12 +912,12 @@ def plot_branch_reoperation_bytes(offset_mapping, format_bytes, output_prefix="o
         int(matches[0]['total_reop_bytes'])
         for matches in offset_mapping.values() if matches
     )
-    attributed_total = math.fsum(value for _, value in stats_branches)
+    attributed_total = math.fsum(float(v) for v in branch_reoperation_bytes.values() if v > 0)
     stats = {
         "operation": op,
         "total_branches": total_all_branches,
         "non_zero_branches": total_non_empty,
-        "total_reop_bytes": int(attributed_total),  # Legacy: ROOT-attributed sum, NOT physical total.
+        "total_reop_bytes": int(round(attributed_total)),  # Legacy: ROOT-attributed sum, NOT physical total.
         "total_reop_bytes_meaning": "sum of proportional branch/page attributions (may differ from physical rereads)",
         "physical_reop_bytes": None if physical_reop_bytes is None else int(physical_reop_bytes),
         "mapped_offset_input_bytes": int(mapped_offset_total),
@@ -1471,6 +1499,37 @@ def _subtract_intervals(a, b):
     return out
 
 
+# ----------------------------------------------------------------------------
+# TODO (not implemented, untested): reread multiplicity / source thread.
+#
+# Today every reread byte is counted ONCE per later read and classified
+# same/cross (same wins when the issuing thread read it before). Not recorded:
+#   * multiplicity: how many earlier reads covered each reread byte
+#   * source threads: WHICH other threads had read it (for cross bytes)
+#
+# Sketch: replay events in time order and keep, per byte range, a read count and
+# a set of reader thread ids, instead of plain merged intervals, e.g.
+#
+#   from collections import defaultdict
+#
+#   def compute_reread_sources(seg_df):
+#       """Yield (time, reader_tid, start, end, n_prior_reads, source_tids)."""
+#       # pieces: sorted, non-overlapping [start, end) with metadata
+#       #   pieces[i] = (start, end, count, frozenset(reader_tids))
+#       pieces = []
+#       for s, e, tid, t in zip(starts, ends, tids, times):
+#           for a, b, cnt, srcs in _pieces_overlapping(pieces, s, e):   # TODO helper
+#               yield (t, tid, a, b, cnt, srcs - {tid} or srcs)         # cross sources
+#           pieces = _pieces_insert(pieces, s, e, tid)   # TODO: split pieces, cnt += 1,
+#                                                        #       srcs |= {tid}
+#
+# Output idea (JSON): per (branch, reader_tid, source_tid): bytes, plus a
+# histogram {n_prior_reads: bytes}. Cost: pieces fragment at every distinct
+# read boundary, so memory/time grow with the number of distinct boundaries
+# (much larger than the merged-interval lists used now) -> put behind a flag
+# such as --reread_sources.
+# ----------------------------------------------------------------------------
+
 def compute_split_reread_chunks(seg_df):
     """
     One pass over the events in order, tracking the bytes read so far by ALL
@@ -1645,6 +1704,81 @@ def _set_byte_axis(axis, set_lim, vmax, n=3):
 # outline colors avoid red/orange/yellow so they stay visible on the YlOrRd cells
 _HIGHLIGHT_COLORS = ['#1f77b4', '#2ca02c', '#9467bd', '#17becf',
                      '#8c564b', '#e377c2', '#003f5c', '#4d4d4d']
+
+
+def compute_branch_thread_kind_matrix(chunks, tree_branch_df, key_col='Branch'):
+    """
+    Reread bytes per (branch|cluster, pthread_id, kind), kind in {'same','cross'}
+    (kind 'combined' when the chunks carry no same/cross split, e.g. old format).
+    Uses the same chunk -> branch intersection as the heatmap, so the entries
+    sum to the per-thread same/cross totals. Returns a list of records sorted
+    by bytes (descending); zero entries are omitted.
+    """
+    if chunks is None or tree_branch_df is None or tree_branch_df.empty or len(chunks['time']) == 0:
+        return []
+    cs = np.asarray(chunks['start'], dtype=np.int64)
+    ce = np.asarray(chunks['end'], dtype=np.int64)
+    tid = np.asarray(chunks['tid']).astype(np.int64)
+    kind = np.asarray(chunks['kind'], dtype=np.int64) if 'kind' in chunks else np.zeros(len(cs), np.int64)
+    m_chunk, m_key, m_bytes, key_names = _attribute_chunks_to_keys(cs, ce, tree_branch_df, key_col)
+    if not m_chunk.size:
+        return []
+    kind_names = ['same', 'cross'] if 'kind' in chunks else ['combined']
+    utid, tinv = np.unique(tid, return_inverse=True)
+    nk, nt, nkind = len(key_names), len(utid), len(kind_names)
+    code = (m_key.astype(np.int64) * nt + tinv[m_chunk]) * nkind + kind[m_chunk]
+    acc = np.bincount(code, weights=m_bytes, minlength=nk * nt * nkind)
+    out = []
+    for c in np.nonzero(acc > 0)[0]:
+        k, rem = divmod(int(c), nt * nkind)
+        ti, ki = divmod(rem, nkind)
+        name = key_names[k]
+        out.append({("cluster" if key_col == 'Cluster' else "branch"):
+                        (int(name) if key_col == 'Cluster' else str(name)),
+                    "pthread_id": str(int(utid[ti])),
+                    "kind": kind_names[ki],
+                    "bytes": int(round(float(acc[c])))})
+    out.sort(key=lambda r: -r["bytes"])
+    return out
+
+
+# =============================================================================
+# TODO (not implemented): reread multiplicity and source thread of each reread
+#
+# Today every reread byte is counted ONCE per later read and classified as
+# same-thread (the issuing thread read it before) or cross-thread (only other
+# threads read it before). "Same" wins when both apply.
+#
+# Wanted additionally, per (branch, thread):
+#   - multiplicity : how many earlier reads covered each reread byte
+#   - source_threads: WHICH other threads had read those bytes first
+#                     (e.g. T2 re-read 10 bytes of branch A that only T1 had read)
+#
+# Sketch only -- NOT executed, NOT tested. Replace the interval lists in
+# compute_split_reread_chunks with a per-thread coverage map:
+#
+#   from collections import defaultdict
+#
+#   def compute_reread_sources(seg_df):
+#       """Yield (time, reader_tid, start, end, source_tid, times_read_before)."""
+#       df = seg_df.sort_values('start_time')
+#       # per-thread sorted, merged intervals: tid -> [(start, end), ...]
+#       per_thread = defaultdict(list)
+#       # global read-count steps: sorted list of (offset, +1/-1 delta) per thread
+#       for row in df.itertuples():
+#           s, e, t = int(row.offset), int(row.offset + row.length), int(row.pthread_id)
+#           for src_tid, ivs in per_thread.items():
+#               for a, b in overlap(ivs, s, e):          # sorted-interval overlap helper
+#                   yield (row.start_time, t, a, b, src_tid,
+#                          read_count_before(a, b))      # count of earlier reads of [a,b)
+#           per_thread[t] = merge(per_thread[t], s, e)   # add this read to the coverage
+#
+# Cost: roughly O(#reads x #threads x overlaps) time and one coverage list per
+# thread in memory; consider a --reread_sources flag, off by default.
+# Suggested output: <prefix>_reread_sources.json with records
+#   {"branch": ..., "reader_pthread": ..., "source_pthread": ...,
+#    "bytes": ..., "multiplicity_hist": {"1": ..., "2": ..., ">=3": ...}}
+# =============================================================================
 
 
 def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
@@ -1880,6 +2014,9 @@ def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
     plt.close(fig)
 
     # ---- JSON with the binned data, for reuse ------------------------------
+    # bytes per (branch|cluster, pthread_id, same|cross); entries sum to the per-thread totals
+    branch_thread_kind = compute_branch_thread_kind_matrix(
+        chunks, tree_branch_df, 'Cluster' if highlight == 'cluster' else 'Branch')
     out = {
         "operation": op,
         "agg": agg,
@@ -1902,6 +2039,7 @@ def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
              "total_bytes": int(totals[i])}
             for r, i in enumerate(order)
         ],
+        "branch_thread_kind": branch_thread_kind,
         "cell_sum_bytes": [[int(v) for v in r] for r in S],
         "cell_value": [[int(v) for v in r] for r in M],
         "top": [
@@ -2040,6 +2178,10 @@ def _run_main(args: Union[Any, None] = None):
             output_prefix = str(_dict.get('name', f"record_{idx}")).replace('/', '_').replace(' ', '_')
         else:
             output_prefix = args.output_prefix
+            if len(dict_list) > 1:
+                # one fixed prefix for several file records would make each record
+                # overwrite the previous record's plots and JSON files
+                output_prefix = f"{output_prefix}_record{idx}"
 
         if not seg_df.size:
             print(f"No data found for '{op}' operation in record '{output_prefix}'. Skipping.")

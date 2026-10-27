@@ -30,3 +30,19 @@ HEP-CCE/SOP darshan reops analysis
       In case of multiple collections, add `--conllection NAME/NAME1,NAME2/all`
       
    Note: The mapping checks if `per_branch_` is part of the `tree_branch_file` name to decide how to map the records and create the plots.
+
+## TODO
+
+- [ ] **Reread multiplicity and source thread.**
+  Today each reread byte is counted once per later read and labelled
+  same-thread or cross-thread; "same" wins if both apply. We also want, per
+  (branch, thread):
+  - **multiplicity**: how many earlier reads covered each reread byte;
+  - **source thread**: which other threads had read those bytes first.
+
+  Proposed: a `--reread_sources` flag (off by default) that writes
+  `<prefix>_reread_sources.json` with records
+  `{branch, reader_pthread, source_pthread, bytes, multiplicity_hist}`.
+  This needs per-thread coverage maps during the replay (more time and
+  memory than the current split). A sketch is in the comment block above
+  `plot_pthread_heatmap` in `plot_offset_histogram.py`.
