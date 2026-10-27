@@ -178,6 +178,9 @@ def _rows_from_dump(data, collection=None, prefix_names=False):
     return rows
 
 
+DEFAULT_COLLECTION = "CollectionTree"
+
+
 def _select_collections(data, requested):
     """
     Return [(name, collection_dict), ...] for either JSON layout.
@@ -194,8 +197,13 @@ def _select_collections(data, requested):
     if requested is None:
         if len(available) == 1:
             return list(available.items())
-        print("Error: tree/branch file contains multiple collections; "
-              "choose with --collection NAME[,NAME2,...] or --collection all.")
+        if DEFAULT_COLLECTION in available:
+            print(f"Note: tree/branch file holds {len(available)} collections; using the default "
+                  f"collection '{DEFAULT_COLLECTION}'. Choose others with --collection "
+                  f"NAME[,NAME2,...] or --collection all.")
+            return [(DEFAULT_COLLECTION, available[DEFAULT_COLLECTION])]
+        print("Error: tree/branch file contains multiple collections and no "
+              f"'{DEFAULT_COLLECTION}'; choose with --collection NAME[,NAME2,...] or --collection all.")
         print(f"Available: {list(available)}")
         sys.exit(1)
 
@@ -1153,8 +1161,16 @@ def setup_parser(parser: argparse.ArgumentParser):
         type=str,
         default=None,
         help="Collection(s) to use from a multi-collection tree/branch JSON: "
-             "NAME, NAME1,NAME2, or 'all'. Optional if the file holds one "
-             "collection or uses the original single-collection format.",
+             "NAME, NAME1,NAME2, or 'all'. Default: the only collection in the file, "
+             "or 'CollectionTree' when the file holds several. 'all' mixes collections, "
+             "and overlapping TTree byte ranges then double-count rereads.",
+    )
+    parser.add_argument(
+        "--no_combined_analysis",
+        action="store_true",
+        help="In --pthread_mode per_thread, skip the full combined (all threads) analysis "
+             "and plots; only the combined total is computed (default: run it, "
+             "output files <prefix>_combined_*).",
     )
     parser.add_argument(
         "--top_n_plot",
@@ -1706,40 +1722,106 @@ _HIGHLIGHT_COLORS = ['#1f77b4', '#2ca02c', '#9467bd', '#17becf',
                      '#8c564b', '#e377c2', '#003f5c', '#4d4d4d']
 
 
+def _union_coverage_fn(tree_branch_df):
+    """Return F(x) = number of bytes < x covered by at least one tree/branch entry."""
+    starts = tree_branch_df['Start_byte'].values.astype(np.int64)
+    if 'End_byte' in tree_branch_df.columns:
+        ends = (tree_branch_df['End_byte']
+                .fillna(tree_branch_df['Start_byte'] + tree_branch_df['Bytes'] - 1)
+                + 1).values.astype(np.int64)
+    else:
+        ends = (tree_branch_df['Start_byte'] + tree_branch_df['Bytes']).values.astype(np.int64)
+    order = np.argsort(starts, kind='stable')
+    starts, ends = starts[order], ends[order]
+    us, ue = [], []
+    for s_, e_ in zip(starts.tolist(), ends.tolist()):
+        if e_ <= s_:
+            continue
+        if us and s_ <= ue[-1]:
+            ue[-1] = max(ue[-1], e_)
+        else:
+            us.append(s_); ue.append(e_)
+    us = np.asarray(us, dtype=np.int64); ue = np.asarray(ue, dtype=np.int64)
+    cum = np.concatenate([[0], np.cumsum(ue - us)]) if len(us) else np.zeros(1, dtype=np.int64)
+
+    def F(x):
+        x = np.asarray(x, dtype=np.int64)
+        if not len(us):
+            return np.zeros(x.shape, dtype=np.int64)
+        j = np.searchsorted(ue, x, side='right')          # intervals fully below x
+        jj = np.minimum(j, len(us) - 1)
+        part = np.where((j < len(us)) & (us[jj] < x), x - us[jj], 0)
+        return cum[j] + part
+    return F
+
+
 def compute_branch_thread_kind_matrix(chunks, tree_branch_df, key_col='Branch'):
     """
     Reread bytes per (branch|cluster, pthread_id, kind), kind in {'same','cross'}
     (kind 'combined' when the chunks carry no same/cross split, e.g. old format).
-    Uses the same chunk -> branch intersection as the heatmap, so the entries
-    sum to the per-thread same/cross totals. Returns a list of records sorted
-    by bytes (descending); zero entries are omitted.
+    Uses the same chunk -> branch intersection as the heatmap.
+
+    Returns (records, reconciliation):
+      records         bytes per (branch|cluster, pthread, kind), sorted descending.
+                      Bytes that lie outside every tree/branch entry are reported as
+                      key '<unmapped>' so each (pthread, kind) can be reconciled.
+      reconciliation  per (pthread, kind): physical (reread bytes), covered (inside some
+                      entry), attributed (sum over branches), unmapped (physical-covered)
+                      and double_counted (attributed-covered: bytes credited to more than
+                      one entry because entry byte ranges overlap, e.g. several TTree
+                      collections). attributed == physical - unmapped + double_counted.
     """
     if chunks is None or tree_branch_df is None or tree_branch_df.empty or len(chunks['time']) == 0:
-        return []
+        return [], []
     cs = np.asarray(chunks['start'], dtype=np.int64)
     ce = np.asarray(chunks['end'], dtype=np.int64)
     tid = np.asarray(chunks['tid']).astype(np.int64)
-    kind = np.asarray(chunks['kind'], dtype=np.int64) if 'kind' in chunks else np.zeros(len(cs), np.int64)
+    split_kinds = 'kind' in chunks
+    kind = np.asarray(chunks['kind'], dtype=np.int64) if split_kinds else np.zeros(len(cs), np.int64)
+    kind_names = ['same', 'cross'] if split_kinds else ['combined']
     m_chunk, m_key, m_bytes, key_names = _attribute_chunks_to_keys(cs, ce, tree_branch_df, key_col)
-    if not m_chunk.size:
-        return []
-    kind_names = ['same', 'cross'] if 'kind' in chunks else ['combined']
     utid, tinv = np.unique(tid, return_inverse=True)
     nk, nt, nkind = len(key_names), len(utid), len(kind_names)
-    code = (m_key.astype(np.int64) * nt + tinv[m_chunk]) * nkind + kind[m_chunk]
-    acc = np.bincount(code, weights=m_bytes, minlength=nk * nt * nkind)
+    label = "cluster" if key_col == 'Cluster' else "branch"
+
+    code2 = tinv * nkind + kind                       # (thread, kind)
+    size2 = nt * nkind
+    F = _union_coverage_fn(tree_branch_df)
+    phys = np.bincount(code2, weights=(ce - cs).astype(float), minlength=size2)
+    cov = np.bincount(code2, weights=(F(ce) - F(cs)).astype(float), minlength=size2)
+    attr = (np.bincount(code2[m_chunk], weights=m_bytes, minlength=size2)
+            if m_chunk.size else np.zeros(size2))
+
     out = []
-    for c in np.nonzero(acc > 0)[0]:
-        k, rem = divmod(int(c), nt * nkind)
-        ti, ki = divmod(rem, nkind)
-        name = key_names[k]
-        out.append({("cluster" if key_col == 'Cluster' else "branch"):
-                        (int(name) if key_col == 'Cluster' else str(name)),
-                    "pthread_id": str(int(utid[ti])),
-                    "kind": kind_names[ki],
-                    "bytes": int(round(float(acc[c])))})
+    if m_chunk.size:
+        code = (m_key.astype(np.int64) * nt + tinv[m_chunk]) * nkind + kind[m_chunk]
+        acc = np.bincount(code, weights=m_bytes, minlength=nk * nt * nkind)
+        for c in np.nonzero(acc > 0)[0]:
+            k, rem = divmod(int(c), nt * nkind)
+            ti, ki = divmod(rem, nkind)
+            name = key_names[k]
+            out.append({label: (int(name) if key_col == 'Cluster' else str(name)),
+                        "pthread_id": str(int(utid[ti])),
+                        "kind": kind_names[ki],
+                        "bytes": int(round(float(acc[c])))})
+    recon = []
+    for ti in range(nt):
+        for ki in range(nkind):
+            c = ti * nkind + ki
+            if phys[c] <= 0:
+                continue
+            unm = int(round(phys[c] - cov[c]))
+            dbl = int(round(attr[c] - cov[c]))
+            if unm > 0:
+                out.append({label: "<unmapped>", "pthread_id": str(int(utid[ti])),
+                            "kind": kind_names[ki], "bytes": unm})
+            recon.append({"pthread_id": str(int(utid[ti])), "kind": kind_names[ki],
+                          "physical_bytes": int(round(phys[c])),
+                          "attributed_bytes": int(round(attr[c])),
+                          "unmapped_bytes": unm,
+                          "double_counted_bytes": max(dbl, 0)})
     out.sort(key=lambda r: -r["bytes"])
-    return out
+    return out, recon
 
 
 # =============================================================================
@@ -2015,8 +2097,18 @@ def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
 
     # ---- JSON with the binned data, for reuse ------------------------------
     # bytes per (branch|cluster, pthread_id, same|cross); entries sum to the per-thread totals
-    branch_thread_kind = compute_branch_thread_kind_matrix(
+    branch_thread_kind, btk_recon = compute_branch_thread_kind_matrix(
         chunks, tree_branch_df, 'Cluster' if highlight == 'cluster' else 'Branch')
+    _unm = sum(r["unmapped_bytes"] for r in btk_recon)
+    _dbl = sum(r["double_counted_bytes"] for r in btk_recon)
+    if btk_recon:
+        print(f"  Branch attribution check: unmapped (outside every tree/branch entry) = "
+              f"{format_bytes(_unm, None)}, double-counted (entries with overlapping byte ranges) = "
+              f"{format_bytes(_dbl, None)}")
+        if _dbl > 0:
+            print("  Warning: some reread bytes are credited to more than one entry because the "
+                  "selected tree/branch byte ranges overlap (TTree ranges from several collections). "
+                  "Select a single collection (--collection) for exact per-branch numbers.")
     out = {
         "operation": op,
         "agg": agg,
@@ -2040,6 +2132,7 @@ def plot_pthread_heatmap(chunks, tree_branch_df=None, output_prefix="output",
             for r, i in enumerate(order)
         ],
         "branch_thread_kind": branch_thread_kind,
+        "branch_thread_kind_reconciliation": btk_recon,
         "cell_sum_bytes": [[int(v) for v in r] for r in S],
         "cell_value": [[int(v) for v in r] for r in M],
         "top": [
@@ -2201,8 +2294,18 @@ def _run_main(args: Union[Any, None] = None):
                 # Only meaningful when no thread filter is applied.
                 combined_total = None
                 if not args.pthread_ids:
-                    tmp, _, _ = compute_reoperation_bytes(seg_df.copy())
-                    combined_total = int(tmp['reoperation'].sum())
+                    if getattr(args, 'no_combined_analysis', False):
+                        tmp, _, _ = compute_reoperation_bytes(seg_df.copy())
+                        combined_total = int(tmp['reoperation'].sum())
+                    else:
+                        # Full combined analysis (all threads together): mapping report,
+                        # branch statistics and the usual plots, files named <prefix>_combined_*
+                        print(f"\n########## ALL pthreads (combined): {len(seg_df)} {op} segments ##########")
+                        combined_total = process_segments(seg_df.copy(), f"{output_prefix}_combined",
+                                                          args, tree_branch_df, op)
+                elif not getattr(args, 'no_combined_analysis', False):
+                    print("Note: combined (all-thread) analysis is skipped because --pthread_ids "
+                          "selects a subset of threads.")
 
                 per_thread_stats = {}
                 workers = getattr(args, 'pthread_workers', 0)
