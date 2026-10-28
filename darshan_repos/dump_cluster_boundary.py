@@ -9,40 +9,57 @@ from concurrent.futures import ThreadPoolExecutor
 # Optimized branch processor (TTree)
 # -----------------------------
 class BranchBasketBytes:
+    """
+    Basket sizes / first entries / FILE positions of one branch.
+    Uses GetWriteBasket() (baskets really written) instead of GetMaxBaskets(): the unused tail of
+    the ROOT arrays is zero-filled, which breaks np.searchsorted and (for small trees) was counted
+    as phantom baskets.
+    """
     def __init__(self, branch: ROOT.TBranch):
-        max_b = branch.GetMaxBaskets()
-        self.basketFirstEntry = np.frombuffer(branch.GetBasketEntry(),
-                                              dtype=np.int64, count=max_b)
-        self.basketBytes = np.frombuffer(branch.GetBasketBytes(),
-                                         dtype=np.int32, count=max_b)
-        self.branchName = branch.GetName()
-        self.maxBaskets = max_b
-        self.iBasket = 0
-        self.isAligned = True
+        n = int(branch.GetWriteBasket())
+        self.branchName = str(branch.GetFullName())     # TString in recent ROOT: must be a plain str for json
+        self.n = n
+        if n:
+            self.firstEntry = np.frombuffer(branch.GetBasketEntry(), dtype=np.int64, count=n).copy()
+            self.sizes = np.frombuffer(branch.GetBasketBytes(), dtype=np.int32, count=n).astype(np.int64)
+            self.seeks = np.array([int(branch.GetBasketSeek(i)) for i in range(n)], dtype=np.int64)
+        else:
+            self.firstEntry = self.sizes = self.seeks = np.zeros(0, dtype=np.int64)
+        self.cluster_idx = None
 
-    def isAlignedWithClusterBoundaries(self):
-        return self.isAligned
+    def assign(self, cluster_begins):
+        """Every basket belongs to the cluster containing its first entry; nothing is dropped.
+        Returns (bytes_per_cluster, baskets_per_cluster)."""
+        ncl = len(cluster_begins)
+        if self.n == 0:
+            self.cluster_idx = np.zeros(0, dtype=np.int64)
+            return np.zeros(ncl, dtype=np.int64), np.zeros(ncl, dtype=np.int64)
+        idx = np.searchsorted(cluster_begins, self.firstEntry, side='right') - 1
+        self.cluster_idx = np.clip(idx, 0, ncl - 1)
+        return (np.bincount(self.cluster_idx, weights=self.sizes, minlength=ncl).astype(np.int64),
+                np.bincount(self.cluster_idx, minlength=ncl).astype(np.int64))
 
-    def bytesInNextCluster(self, clusterBegin, clusterEnd):
-        """Optimized NumPy + searchsorted for TTree baskets"""
-        if self.iBasket >= self.maxBaskets:
-            return (0, 0, True)
+    def file_ranges(self, k):
+        """True [start, end) file ranges of the baskets of cluster k, adjacent ranges merged."""
+        lo = np.searchsorted(self.cluster_idx, k, side='left')
+        hi = np.searchsorted(self.cluster_idx, k, side='right')
+        order = np.argsort(self.seeks[lo:hi], kind='stable')
+        out = []
+        for st, sz in zip(self.seeks[lo:hi][order].tolist(), self.sizes[lo:hi][order].tolist()):
+            if sz <= 0:
+                continue
+            if out and out[-1][1] == st:
+                out[-1][1] = st + sz
+            else:
+                out.append([st, st + sz])
+        return out
 
-        if self.basketFirstEntry[self.iBasket] > clusterBegin:
-            self.isAligned = False
-            return (0, 0, True)
 
-        rel_end_idx = np.searchsorted(self.basketFirstEntry[self.iBasket:self.maxBaskets], clusterEnd, side='left')
-        end_idx = self.iBasket + rel_end_idx
-
-        bytes_sum = np.sum(self.basketBytes[self.iBasket:end_idx])
-        baskets_sum = end_idx - self.iBasket
-
-        if end_idx < self.maxBaskets and self.basketFirstEntry[end_idx] < clusterEnd:
-            self.isAligned = False
-
-        self.iBasket = end_idx
-        return (int(bytes_sum), int(baskets_sum), self.isAligned)
+def _all_branches(branches):
+    """Top-level branches and, recursively, all sub-branches (their baskets hold data too)."""
+    for br in branches:
+        yield br
+        yield from _all_branches(br.GetListOfBranches())
 
 # -----------------------------
 # Optimized field processor (RNTuple)
@@ -136,10 +153,12 @@ class RNTupleFieldMap:
 
         Replaces the old _get_locator_offset() free function.
         """
-        for typ in (ROOT.std.uint64_t, 'unsigned long long', int):
+        # In ROOT >= 6.34 the position is std::variant<std::uint64_t, RNTupleLocatorObject64>;
+        # std::uint64_t is 'unsigned long' on Linux, so 'unsigned long long' does not instantiate.
+        for typ in (ROOT.std.uint64_t, 'unsigned long'):
             try:
                 return int(loc.GetPosition[typ]())
-            except TypeError:
+            except (TypeError, AttributeError):
                 continue
         raise RuntimeError(
             f"Cannot instantiate GetPosition() on locator of type {type(loc)}"
@@ -181,89 +200,95 @@ class RNTupleFieldMap:
         return (bytes_sum, pages_count, self.isAligned)
 
 def clusterPrintTTree(tree, input_file, max_workers=None, per_branch=False):
-    """Processes TTree to get cluster boundaries with formatted JSON output."""
-    branches = tree.GetListOfBranches()
-    branch_processors = [BranchBasketBytes(b) for b in branches]
+    """Processes TTree to get cluster boundaries with formatted JSON output.
+
+    start_byte/end_byte are running per-tree CURSORS (back-compatible, they overlap between
+    collections). With per_branch=True every branch entry also carries "file_ranges": the true
+    [start, end) file positions of its baskets in that cluster."""
+    branch_processors = [BranchBasketBytes(b) for b in _all_branches(tree.GetListOfBranches())]
+    entries = int(tree.GetEntries())
 
     iterator = tree.GetClusterIterator(0)
-    entries = tree.GetEntries()
+    begins, ends = [], []
+    cb = iterator()
+    while cb < entries:
+        nxt = iterator()
+        ce = entries if nxt <= cb else nxt
+        begins.append(int(cb)); ends.append(int(ce))
+        cb = ce
+    cluster_begins = np.array(begins, dtype=np.int64)
+    ncl = len(begins)
+
+    per_bp = {bp.branchName: bp.assign(cluster_begins) for bp in branch_processors}
 
     results = []
-    cluster_index = 0
     current_byte_offset = 0
-    
-    cluster_begin = iterator() 
+    branch_totals_data = {bp.branchName: {"entries": entries, "bytes": 0, "baskets": 0,
+                                          "start_byte": 0, "last_end_byte": 0,
+                                          "file_start": None, "file_end": 0}
+                          for bp in branch_processors}
 
-    branch_totals_data = {}
-    branch_order = [bp.branchName for bp in branch_processors]
-    
-    for bp in branch_processors:
-        branch_totals_data[bp.branchName] = {
-            "entries": int(entries), "bytes": 0, "baskets": 0,
-            "start_byte": 0, "last_end_byte": 0
-        }
-
-    first_cluster = True
-    while cluster_begin < entries:
-        next_cluster_start = iterator()
-        cluster_end = entries if next_cluster_start <= cluster_begin else next_cluster_start
-
+    for k in range(ncl):
         cluster_bytes = 0
         cluster_baskets = 0
         branch_info_list = []
         cluster_branch_offset = current_byte_offset
 
         for bp in branch_processors:
-            b_bytes, b_baskets, _ = bp.bytesInNextCluster(cluster_begin, cluster_end)
+            b_bytes = int(per_bp[bp.branchName][0][k])
+            b_baskets = int(per_bp[bp.branchName][1][k])
             b_start = cluster_branch_offset
             b_end = b_start + b_bytes - 1 if b_bytes > 0 else b_start
+            tot = branch_totals_data[bp.branchName]
 
-            if first_cluster:
-                branch_totals_data[bp.branchName]["start_byte"] = b_start
-
-            branch_totals_data[bp.branchName]["bytes"] += b_bytes
-            branch_totals_data[bp.branchName]["baskets"] += b_baskets
+            if k == 0:
+                tot["start_byte"] = b_start
+            tot["bytes"] += b_bytes
+            tot["baskets"] += b_baskets
             if b_bytes > 0:
-                branch_totals_data[bp.branchName]["last_end_byte"] = b_end
+                tot["last_end_byte"] = b_end
 
             if per_branch:
+                rng = bp.file_ranges(k)
                 branch_info_list.append({
                     "branch": bp.branchName, "start_byte": b_start, "end_byte": b_end,
-                    "bytes": b_bytes, "baskets": b_baskets
+                    "bytes": b_bytes, "baskets": b_baskets, "file_ranges": rng
                 })
                 cluster_branch_offset += b_bytes
-            
+                if rng:
+                    tot["file_start"] = rng[0][0] if tot["file_start"] is None else min(tot["file_start"], rng[0][0])
+                    tot["file_end"] = max(tot["file_end"], max(r[1] for r in rng))
+
             cluster_bytes += b_bytes
             cluster_baskets += b_baskets
 
         total_bytes = int(cluster_bytes)
         cluster_data = {
-            "cluster_index": cluster_index,
-            "begin": int(cluster_begin), "end": int(cluster_end),
-            "entries": int(cluster_end - cluster_begin),
+            "cluster_index": k,
+            "begin": begins[k], "end": ends[k],
+            "entries": ends[k] - begins[k],
             "start_byte": current_byte_offset,
             "end_byte": current_byte_offset + total_bytes - 1 if total_bytes > 0 else current_byte_offset,
-            "total_bytes": total_bytes, "max_baskets": cluster_baskets
+            "total_bytes": total_bytes, "max_baskets": int(cluster_baskets)
         }
         if per_branch: cluster_data["branches"] = branch_info_list
-        
+
         results.append(cluster_data)
         current_byte_offset += total_bytes
-        cluster_index += 1
-        cluster_begin = cluster_end
-        first_cluster = False
 
-    output = {"file_name": input_file, "type": "TTree", "tree_name": tree.GetName(), 
-              "total_entries": int(entries), "clusters": results}
+    output = {"file_name": input_file, "type": "TTree", "tree_name": tree.GetName(),
+              "total_entries": entries, "clusters": results,
+              "offsets": "start_byte/end_byte are per-tree cursors; branches[].file_ranges are file positions"}
 
     if per_branch:
         final_branch_totals = {}
-        for name in branch_order:
-            b_sum = branch_totals_data[name]
-            final_branch_totals[name] = {
+        for bp in branch_processors:
+            b_sum = branch_totals_data[bp.branchName]
+            final_branch_totals[bp.branchName] = {
                 "entries": b_sum["entries"], "bytes": b_sum["bytes"], "baskets": b_sum["baskets"],
                 "start_byte": b_sum["start_byte"],
-                "end_byte": b_sum["last_end_byte"] if b_sum["bytes"] > 0 else b_sum["start_byte"]
+                "end_byte": b_sum["last_end_byte"] if b_sum["bytes"] > 0 else b_sum["start_byte"],
+                "file_start": b_sum["file_start"], "file_end": b_sum["file_end"],
             }
         output["branch_totals"] = final_branch_totals
     return output
@@ -315,6 +340,10 @@ def clusterPrintRNTuple(ntuple, tree_name, input_file,
 
     # ── cluster walk ──────────────────────────────────────────────────────
     clusters   = []
+    page_owners = {}        # (offset, nbytes) -> [(col_id, field_name), ...]  (pages shared by columns)
+    page_refs   = []        # (key, col_id, page_dict) to annotate after the walk
+    physical_total = 0      # bytes of distinct, real (non-virtual) pages
+    virtual_pages = virtual_bytes = 0
     nclusters  = desc.GetNClusters()
     cluster_id = desc.FindClusterId(0, 0)
 
@@ -332,6 +361,8 @@ def clusterPrintRNTuple(ntuple, tree_name, input_file,
 
         cluster_total_bytes = 0
         cluster_total_pages = 0
+        cluster_uncompressed = 0
+        cluster_physical     = 0
         field_info_list     = []
 
         # byte cursor within this cluster (for per-field start/end bytes)
@@ -394,8 +425,21 @@ def clusterPrintRNTuple(ntuple, tree_name, input_file,
                 col_uncompressed += uncomp
                 col_pages        += 1
 
+                # offset 0 cannot be a real page position (the file header lives there): virtual page
+                virtual = (offset == 0)
+                key = (offset, length)
+                if virtual:
+                    virtual_pages += 1
+                    virtual_bytes += length
+                else:
+                    owners = page_owners.setdefault(key, [])
+                    if not owners:                         # first column to reference this page
+                        cluster_physical += length
+                        physical_total   += length
+                    owners.append((col_id, field_name))
+
                 if per_branch:
-                    pages_list.append({
+                    page_dict = {
                         "page_index":         page_idx,
                         "offset":             offset,
                         "end":                offset + length,
@@ -403,7 +447,11 @@ def clusterPrintRNTuple(ntuple, tree_name, input_file,
                         "uncompressed_bytes": uncomp,
                         "n_elements":         n_elems,
                         "is_compressed":      is_comp,
-                    })
+                        "virtual":            virtual,
+                    }
+                    pages_list.append(page_dict)
+                    if not virtual:
+                        page_refs.append((key, col_id, page_dict))
 
                 if verbose:
                     comp_label = (f"compressed → {uncomp}B"
@@ -440,15 +488,11 @@ def clusterPrintRNTuple(ntuple, tree_name, input_file,
             cluster_field_offset += col_compressed
             cluster_total_bytes  += col_compressed
             cluster_total_pages  += col_pages
+            cluster_uncompressed += col_uncompressed
 
         cluster_end_byte = (current_byte_offset + cluster_total_bytes - 1
                             if cluster_total_bytes > 0
                             else current_byte_offset)
-
-        cluster_uncompressed = sum(
-            ft["uncompressed_bytes"]
-            for ft in field_totals_data.values()
-        )
 
         cluster_dict = {
             "cluster_index":      int(cluster_id),
@@ -458,7 +502,8 @@ def clusterPrintRNTuple(ntuple, tree_name, input_file,
             "start_byte":         current_byte_offset,
             "end_byte":           cluster_end_byte,
             "total_bytes":        cluster_total_bytes,         # compressed, mirrors TTree
-            "uncompressed_bytes": cluster_total_bytes,         # see note below
+            "uncompressed_bytes": cluster_uncompressed,
+            "physical_bytes":     cluster_physical,            # distinct pages only (shared pages once)
             "max_pages":          cluster_total_pages,         # mirrors max_baskets
             "compression":        compression_string,
         }
@@ -469,13 +514,22 @@ def clusterPrintRNTuple(ntuple, tree_name, input_file,
         current_byte_offset += cluster_total_bytes
         cluster_id = desc.FindNextClusterId(cluster_id)
 
+    # ── mark pages shared by several columns (same offset+size) ───────────
+    for key, col_id, page_dict in page_refs:
+        owners = page_owners[key]
+        page_dict["shared_count"] = len(owners)
+        page_dict["is_owner"] = (owners[0][0] == col_id)       # count physical bytes once, at the owner
+        if len(owners) > 1:
+            page_dict["shared_with"] = [nm for cid, nm in owners if cid != col_id][:8]
+
     # ── field_totals: mirrors branch_totals ───────────────────────────────
     field_totals = {}
     for col_id in field_order:
         ft = field_totals_data[col_id]
         col_ratio = (ft["uncompressed_bytes"] / ft["compressed_bytes"]
                      if ft["compressed_bytes"] > 0 else 1.0)
-        field_totals[ft["field"]] = {
+        ft_key = ft["field"] if ft["field"] not in field_totals else f'{ft["field"]}#col{col_id}'
+        field_totals[ft_key] = {
             "entries":            ft["entries"],
             "compressed_bytes":   ft["compressed_bytes"],    # mirrors "bytes"
             "uncompressed_bytes": ft["uncompressed_bytes"],
@@ -502,7 +556,11 @@ def clusterPrintRNTuple(ntuple, tree_name, input_file,
         "field_totals":  field_totals,           # mirrors "branch_totals"
         # ── RNTuple-only extras ──
         "compression":          compression_string,
-        "compressed_bytes":     grand_compressed,
+        "compressed_bytes":     grand_compressed,        # per-column sum (matches RNTupleInspector)
+        "physical_compressed_bytes": physical_total,     # distinct real pages: shared pages once
+        "shared_pages_extra_bytes":  grand_compressed - physical_total - virtual_bytes,
+        "virtual_pages":        virtual_pages,           # offset 0: not real file positions
+        "virtual_bytes":        virtual_bytes,
         "uncompressed_bytes":   grand_uncompressed,
         "compression_ratio":    round(grand_ratio, 4),
         "n_clusters":           nclusters,
