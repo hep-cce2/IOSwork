@@ -18,6 +18,29 @@ from matplotlib.colors import LogNorm
 import pandas as pd
 import numpy as np
 
+def order_by_time(seg_df, sort=False):
+    """
+    The reread analysis treats row order as time order: a read is a reread when an
+    EARLIER ROW already covered its bytes, and it is credited to the later row (thread).
+    DXT segments are not guaranteed to be listed by start_time (for example one thread's
+    block can precede another's), so check, warn, and optionally stable-sort by start_time.
+    """
+    if seg_df is None or not len(seg_df) or 'start_time' not in seg_df.columns:
+        return seg_df
+    t = seg_df['start_time'].values
+    n_back = int((t[1:] < t[:-1]).sum())
+    if n_back == 0:
+        return seg_df
+    if sort:
+        print(f"Sorting {len(seg_df)} segments by start_time (stable): {n_back} rows were out of "
+              f"time order in the log.")
+        return seg_df.sort_values('start_time', kind='stable').reset_index(drop=True)
+    print(f"Warning: {n_back} of {len(seg_df)} segments are listed out of start_time order. "
+          f"Rereads are credited by row order, so 'earlier' may not mean earlier in time; "
+          f"use --sort_by_time to sort by start_time first.")
+    return seg_df
+
+
 def format_bytes(y, pos):
     if y == 0: return "0B"
     if not np.isfinite(y): return str(y)
@@ -102,8 +125,24 @@ def unique_short_names(names, width=None):
     return [short[n] for n in names]
 
 
-def _rows_from_dump(data, collection=None, prefix_names=False):
-    """Flatten ONE collection dict (the old flat shape) into DataFrame rows."""
+def _has_file_offsets(data):
+    """True when a collection's byte ranges are real file positions: TTree dumps with
+    branches[].file_ranges, RNTuple dumps with per-page offsets. Older dumps only carry
+    per-tree running cursors, which overlap between collections."""
+    for cluster in data.get("clusters", []):
+        if data.get("type", "TTree") == "RNTuple":
+            return any(fd.get("pages") for fd in cluster.get("fields", []))
+        return any("file_ranges" in bd for bd in cluster.get("branches", []))
+    return False
+
+
+def _rows_from_dump(data, collection=None, prefix_names=False, stats=None):
+    """Flatten ONE collection dict into DataFrame rows.
+
+    Offset_kind is 'file' for true file positions (TTree file_ranges, RNTuple pages) and
+    'cursor' for the per-tree running cursors of older dumps. RNTuple pages at offset 0 are
+    not real file positions (the file header lives there) and are skipped; they are counted
+    in `stats`."""
     data_type = data.get("type", "TTree")
     coll_name = collection or data.get("tree_name", "")
 
@@ -122,7 +161,7 @@ def _rows_from_dump(data, collection=None, prefix_names=False):
         defaults = {
             'Column_id': -1, 'Field_id': -1, 'Column_type': '',
             'Uncompressed_bytes': 0, 'Page_index': -1, 'N_elements': 0,
-            'Is_compressed': False,
+            'Is_compressed': False, 'Share': 1, 'Offset_kind': 'cursor',
         }
 
         if data_type == "RNTuple" and "fields" in cluster:
@@ -135,6 +174,11 @@ def _rows_from_dump(data, collection=None, prefix_names=False):
                 pages = fd.get("pages", [])
                 if pages:
                     for p in pages:
+                        if p["offset"] == 0:
+                            if stats is not None:
+                                stats['virtual_pages'] = stats.get('virtual_pages', 0) + 1
+                                stats['virtual_bytes'] = stats.get('virtual_bytes', 0) + p["compressed_bytes"]
+                            continue
                         rows.append({**base,
                             'Start_byte':         p["offset"],
                             'End_byte':           p["end"] - 1,
@@ -144,7 +188,10 @@ def _rows_from_dump(data, collection=None, prefix_names=False):
                             'Page_index':         p["page_index"],
                             'N_elements':         p.get("n_elements", 0),
                             'Is_compressed':      p.get("is_compressed", False),
+                            'Offset_kind':        'file',
                             'Granularity':        'page'})
+                elif fd.get("compressed_bytes", 0) == 0:
+                    continue        # no bytes on disk: its cursor position is not a file position
                 else:
                     rows.append({**base,
                         'Start_byte':         fd.get("start_byte", 0),
@@ -156,13 +203,26 @@ def _rows_from_dump(data, collection=None, prefix_names=False):
 
         elif "branches" in cluster:
             for bd in cluster["branches"]:
-                rows.append({**common, **defaults,
-                    'Branch':      name_of(bd["branch"]),
-                    'Start_byte':  bd["start_byte"],
-                    'End_byte':    bd["end_byte"],
-                    'Bytes':       bd["bytes"],
-                    'Baskets':     bd.get("baskets", 1),
-                    'Granularity': 'basket'})
+                ranges = bd.get("file_ranges")
+                if ranges is not None:
+                    # one row per contiguous [start, end) range of baskets on disk
+                    for r_start, r_end in ranges:
+                        rows.append({**common, **defaults,
+                            'Branch':      name_of(bd["branch"]),
+                            'Start_byte':  r_start,
+                            'End_byte':    r_end - 1,
+                            'Bytes':       r_end - r_start,
+                            'Baskets':     1,
+                            'Offset_kind': 'file',
+                            'Granularity': 'basket_range'})
+                else:
+                    rows.append({**common, **defaults,
+                        'Branch':      name_of(bd["branch"]),
+                        'Start_byte':  bd["start_byte"],
+                        'End_byte':    bd["end_byte"],
+                        'Bytes':       bd["bytes"],
+                        'Baskets':     bd.get("baskets", 1),
+                        'Granularity': 'basket'})
 
         else:  # cluster-level fallback
             # Not prefixed: downstream plotting keys on the "cluster_" name.
@@ -198,10 +258,17 @@ def _select_collections(data, requested):
         if len(available) == 1:
             return list(available.items())
         if DEFAULT_COLLECTION in available:
+            exact = all(_has_file_offsets(d) for d in available.values())
             print(f"Note: tree/branch file holds {len(available)} collections; using the default "
                   f"collection '{DEFAULT_COLLECTION}'. Choose others with --collection "
-                  f"NAME[,NAME2,...] or --collection all.")
+                  f"NAME[,NAME2,...] or --collection all."
+                  + (" All collections carry true file offsets, so --collection all maps the whole "
+                     "file without double counting." if exact else ""))
             return [(DEFAULT_COLLECTION, available[DEFAULT_COLLECTION])]
+        if all(_has_file_offsets(d) for d in available.values()):
+            print(f"Note: tree/branch file holds {len(available)} collections without '{DEFAULT_COLLECTION}'; "
+                  f"all carry true file offsets, so all of them are mapped (same as --collection all).")
+            return list(available.items())
         print("Error: tree/branch file contains multiple collections and no "
               f"'{DEFAULT_COLLECTION}'; choose with --collection NAME[,NAME2,...] or --collection all.")
         print(f"Available: {list(available)}")
@@ -233,23 +300,40 @@ def load_tree_branch_data(tree_branch_file, collection=None):
     selected = _select_collections(data, collection)   # may sys.exit on bad names
     multi = len(selected) > 1
 
-    if multi and any(d.get("type", "TTree") == "TTree" for _, d in selected):
-        print("Warning: TTree byte ranges are cumulative per-tree cursors, not "
-              "file offsets, so they overlap between collections. Mapping "
-              "against several collections that include a TTree is ambiguous; "
-              "prefer selecting one.")
+    cursor_trees = [n for n, d in selected
+                    if d.get("type", "TTree") == "TTree" and not _has_file_offsets(d)]
+    if multi and cursor_trees:
+        print("Warning: these TTree collections only carry per-tree cursors (no file_ranges), "
+              f"which overlap between collections: {cursor_trees}. Mapping several of them is "
+              "ambiguous (rereads are credited to every overlapping entry); select one collection "
+              "or re-dump with the current dumper.")
 
     try:
-        rows = []
+        rows, dump_stats = [], {}
         for name, d in selected:
-            rows.extend(_rows_from_dump(d, collection=name, prefix_names=multi))
+            rows.extend(_rows_from_dump(d, collection=name, prefix_names=multi, stats=dump_stats))
 
         df = pd.DataFrame(rows)
         if not df.empty:
+            # RNTuple pages stored once but referenced by several columns (same offset and size):
+            # a reread of such a page is split equally among the sharing fields (Share = number of
+            # fields), so the credited bytes add up to the physical bytes read.
+            is_page = (df['Granularity'] == 'page').values
+            if is_page.any():
+                grp = df[is_page].groupby(['Collection', 'Start_byte', 'End_byte'])['Branch'].transform('nunique')
+                df.loc[is_page, 'Share'] = grp.values
+                n_shared = int((df.loc[is_page, 'Share'] > 1).sum())
+                if n_shared:
+                    print(f"RNTuple: {n_shared:,} page records are shared by several fields; "
+                          f"rereads on them are split equally among those fields.")
+            if dump_stats.get('virtual_pages'):
+                print(f"RNTuple: skipped {dump_stats['virtual_pages']:,} pages at offset 0 "
+                      f"({dump_stats['virtual_bytes']:,} bytes): not real file positions.")
             kinds = {n: d.get("type", "TTree") for n, d in selected}
             print(f"Loaded DataFrame from {kinds}")
             print(f"Shape:       {df.shape}")
             print(f"Granularity: {df['Granularity'].value_counts().to_dict()}")
+            print(f"Offsets:     {df['Offset_kind'].value_counts().to_dict()}")
             print(f"First few rows:\n{df.head()}")
         else:
             print("Warning: No data loaded from the file")
@@ -318,6 +402,9 @@ def map_offsets_to_tree_branches(reop_data, tree_branch_df):
     is_comp_vals      = (tree_branch_df['Is_compressed'].values
                          if 'Is_compressed' in tree_branch_df.columns
                          else np.zeros(len(tree_branch_df), dtype=bool))
+    share_vals        = (tree_branch_df['Share'].values.astype(float)
+                         if 'Share' in tree_branch_df.columns
+                         else np.ones(len(tree_branch_df)))
 
     for offset in offsets:
         info = reop_data[offset]
@@ -366,6 +453,7 @@ def map_offsets_to_tree_branches(reop_data, tree_branch_df):
             else:
                 ratio = intersect_len / (ov_end - ov_start) if (ov_end - ov_start) > 0 else 0
                 attributed_reop_bytes = total_reop_bytes * ratio
+            attributed_reop_bytes /= share_vals[branch_idx]      # shared RNTuple page: equal split
 
             match = {
                 'collection':           str(row['Collection']) if 'Collection' in row.index else '',
@@ -391,6 +479,7 @@ def map_offsets_to_tree_branches(reop_data, tree_branch_df):
                 'column_type':          str(column_type_vals[branch_idx]),
                 'uncompressed_bytes':   int(uncomp_vals[branch_idx]),
                 'is_compressed':        bool(is_comp_vals[branch_idx]),
+                'shared_count':         int(share_vals[branch_idx]),
             }
             matches.append(match)
 
@@ -456,6 +545,7 @@ def _match_to_json(m, format_bytes, offset=None):
         'uncompressed_bytes':          int(m['uncompressed_bytes']),
         'uncompressed_bytes_formatted':format_bytes(m['uncompressed_bytes'], None),
         'is_compressed':               bool(m['is_compressed']),
+        'shared_count':                int(m.get('shared_count', 1)),
     }
     if offset is not None:
         out['offset'] = int(offset)
@@ -888,13 +978,20 @@ def plot_branch_reoperation_bytes(offset_mapping, format_bytes, output_prefix="o
         total_all_branches = len(tree_branch_df['Branch'].unique())
     
     branch_reoperation_bytes = {}
+    # Part of each branch's bytes that comes from RNTuple pages shared by several fields.
+    # Those bytes are an equal-split estimate (the file cannot say which field caused the
+    # read); everything else is exact.
+    branch_shared_bytes = {}
     
     # Safely aggregate the newly calculated volumetric reoperation_bytes from matches
     for offset, matches in offset_mapping.items():
         if matches:
             for match in matches:
                 branch_name = str(match['branch'])
-                branch_reoperation_bytes[branch_name] = branch_reoperation_bytes.get(branch_name, 0) + match.get('reoperation_bytes', 0)
+                rb = match.get('reoperation_bytes', 0)
+                branch_reoperation_bytes[branch_name] = branch_reoperation_bytes.get(branch_name, 0) + rb
+                if int(match.get('shared_count', 1)) > 1:
+                    branch_shared_bytes[branch_name] = branch_shared_bytes.get(branch_name, 0) + rb
 
     if not branch_reoperation_bytes:
         print(f"No branch reoperation data found to plot for {op}.")
@@ -906,8 +1003,10 @@ def plot_branch_reoperation_bytes(offset_mapping, format_bytes, output_prefix="o
     # Use all active branches for JSON, independently of --top_n_plot. Totals are summed
     # from the exact (float) attributions and only rounded for display: truncating each
     # branch with int() dropped up to 1 byte per branch from the total.
-    non_empty_branches = [(name, int(round(value))) for name, value in branch_reoperation_bytes.items()
-                          if round(value) > 0]
+    # Per-branch values stay floats (3 decimals): with shared pages the equal split gives
+    # fractions, and rounding to whole bytes would hide them.
+    non_empty_branches = [(name, round(float(value), 3)) for name, value in branch_reoperation_bytes.items()
+                          if value > 1e-6]
     total_non_empty = len(non_empty_branches)
     if not non_empty_branches:
         print(f"No positive branch reoperation data found for {op}.")
@@ -933,7 +1032,12 @@ def plot_branch_reoperation_bytes(offset_mapping, format_bytes, output_prefix="o
         "attributed_to_physical_ratio": (
             attributed_total / physical_reop_bytes if physical_reop_bytes else None
         ),
-        "branches": [{"name": name, "bytes": value} for name, value in stats_branches],
+        "shared_page_reop_bytes": round(math.fsum(branch_shared_bytes.values()), 3),
+        "shared_page_reop_bytes_meaning": "part of total_reop_bytes on RNTuple pages shared by several "
+                                          "fields, split equally among them (an estimate)",
+        "branches": [{"name": name, "bytes": value,
+                      "shared_bytes": round(float(branch_shared_bytes.get(name, 0)), 3)}
+                     for name, value in stats_branches],
     }
     if physical_reop_bytes is not None and not math.isclose(
         attributed_total, physical_reop_bytes, rel_tol=1e-8, abs_tol=1
@@ -972,15 +1076,38 @@ def plot_branch_reoperation_bytes(offset_mapping, format_bytes, output_prefix="o
     display_names = unique_short_names(branch_names,
                                        width=min(NAME_WIDTH, 50) if NAME_WIDTH > 0 else 0)
     
+    # Figure width = room for the longest name + a plot area wide enough that the x tick
+    # labels (about 8 characters each) do not overlap at the label font size.
+    label_fs = 10
+    char_in = label_fs * 0.62 / 72.0                     # approx. inches per character
+    label_in = max((len(n) for n in display_names), default=10) * char_in + 0.6
+    plot_in = 6.5
+    n_xticks = max(3, int(plot_in / 1.15))
     fig_height = max(2.5, 1 + 0.3 * len(display_names))
-    fig, ax = plt.subplots(figsize=(8, fig_height))
+    fig, ax = plt.subplots(figsize=(label_in + plot_in, fig_height))
     if top_n == -1 and is_cluster_mode:
         fig1, ax1 = plt.subplots(figsize=(14, 4))
     
-    bars = ax.barh(range(len(display_names)), reop_bytes, color='steelblue', alpha=0.7, edgecolor='black', linewidth=0.5)
+    shared_bytes = [min(float(branch_shared_bytes.get(n, 0)), v) for n, v in zip(branch_names, reop_bytes)]
+    has_shared = (not is_cluster_mode) and any(x > 0 for x in shared_bytes)
+    if has_shared:
+        # solid = exact part, hatched = part from shared pages (equal-split estimate)
+        exact_bytes = [v - x for v, x in zip(reop_bytes, shared_bytes)]
+        bars = ax.barh(range(len(display_names)), exact_bytes, color='steelblue', alpha=0.7,
+                       edgecolor='black', linewidth=0.5)
+        ax.barh(range(len(display_names)), shared_bytes, left=exact_bytes, color='white',
+                edgecolor='#d62728', hatch='////', linewidth=0.8)
+        from matplotlib.patches import Patch
+        ax.legend(handles=[Patch(facecolor='steelblue', alpha=0.7, edgecolor='black',
+                                 label='exact (page used by this field only)'),
+                           Patch(facecolor='white', edgecolor='#d62728', hatch='////',
+                                 label='estimate (shared page, split equally)')],
+                  loc='lower right', fontsize=8)
+    else:
+        bars = ax.barh(range(len(display_names)), reop_bytes, color='steelblue', alpha=0.7, edgecolor='black', linewidth=0.5)
     
     ax.set_yticks(range(len(display_names)))
-    ax.set_yticklabels(display_names, fontsize=10)
+    ax.set_yticklabels(display_names, fontsize=label_fs)
     ax.set_xlabel('Reoperation Volume', fontsize=12, labelpad=10)
     ax.set_ylabel('Cluster Index' if is_cluster_mode else 'Branch/Field Names', fontsize=12)
     
@@ -989,16 +1116,21 @@ def plot_branch_reoperation_bytes(offset_mapping, format_bytes, output_prefix="o
                  fontsize=10, pad=10, fontweight='bold')
     
     # Nicer ticks
-    ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=8, steps=[1, 2, 5, 10]))
+    ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=n_xticks, steps=[1, 2, 5, 10]))
     ax.xaxis.set_major_formatter(ticker.FuncFormatter(format_bytes))
     ax.xaxis.set_minor_locator(ticker.AutoMinorLocator(n=2))
     ax.grid(True, axis='x', which='major', linestyle='-', alpha=0.4)
     ax.grid(True, axis='x', which='minor', linestyle=':', alpha=0.2)
     
     max_width = max(reop_bytes) if reop_bytes else 0
-    for bar, value in zip(bars, reop_bytes):
-        width = bar.get_width()
-        if width > max_width * 0.15:
+    for bar, value, sh in zip(bars, reop_bytes, shared_bytes):
+        # with the stacked bar, bar.get_width() is only the exact part: use the full value
+        width = value
+        if has_shared and sh > 0:
+            ax.text(value + (max_width * 0.01), bar.get_y() + bar.get_height()/2,
+                    f"{format_bytes(value, None)}  ({100.0 * sh / value:.0f}% shared)",
+                    ha='left', va='center', fontsize=8, color='#d62728')
+        elif width > max_width * 0.15:
             ax.text(width * 0.98, bar.get_y() + bar.get_height()/2, 
                    format_bytes(value, None), 
                    ha='right', va='center', fontweight='bold', fontsize=9, color='white')
@@ -1162,8 +1294,9 @@ def setup_parser(parser: argparse.ArgumentParser):
         default=None,
         help="Collection(s) to use from a multi-collection tree/branch JSON: "
              "NAME, NAME1,NAME2, or 'all'. Default: the only collection in the file, "
-             "or 'CollectionTree' when the file holds several. 'all' mixes collections, "
-             "and overlapping TTree byte ranges then double-count rereads.",
+             "or 'CollectionTree' when the file holds several. 'all' maps every collection: "
+             "exact with dumps that carry true file offsets (file_ranges / RNTuple pages), "
+             "but older cursor-based TTree dumps overlap and double-count rereads.",
     )
     parser.add_argument(
         "--no_combined_analysis",
@@ -1273,6 +1406,14 @@ def setup_parser(parser: argparse.ArgumentParser):
     )
 
     # ---- printout / plot labels ----
+    parser.add_argument(
+        "--sort_by_time",
+        action="store_true",
+        help="Stable-sort the DXT segments by start_time before the analysis. Rereads are "
+             "credited by row order, so this makes 'earlier read' mean earlier in time "
+             "when the log lists segments out of time order (a warning is printed "
+             "when it does; default: keep the log order).",
+    )
     parser.add_argument(
         "--name_width",
         type=int,
@@ -1639,8 +1780,10 @@ def _attribute_chunks_to_keys(cs, ce, tree_branch_df, key_col):
 
     codes, names = pd.factorize(tree_branch_df[key_col])
     codes = np.asarray(codes)
+    share = (tree_branch_df['Share'].values.astype(float) if 'Share' in tree_branch_df.columns
+             else np.ones(len(tree_branch_df)))
     order = np.argsort(starts, kind='stable')
-    starts, ends, codes = starts[order], ends[order], codes[order]
+    starts, ends, codes, share = starts[order], ends[order], codes[order], share[order]
     cummax_end = np.maximum.accumulate(ends)
 
     # candidates for chunk i are entries [lo_i, hi_i): start < ce_i and
@@ -1657,7 +1800,7 @@ def _attribute_chunks_to_keys(cs, ce, tree_branch_df, key_col):
         if n:
             m_chunk.append(np.full(n, i, dtype=np.int64))
             m_key.append(codes[lo:hi][ok])
-            m_bytes.append(ov[ok].astype(float))
+            m_bytes.append(ov[ok].astype(float) / share[lo:hi][ok])
     if not m_chunk:
         return (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64),
                 np.zeros(0), list(names))
@@ -2260,13 +2403,24 @@ def _run_main(args: Union[Any, None] = None):
               f"Available modules in this log: {list(report.records.keys())}\n")
         sys.exit(1)
     dict_list = report.records[mod].to_df()
+    if len(dict_list) == 0:
+        _names = getattr(report, "name_records", {}) or {}
+        _names = sorted(set(str(n) for n in (_names.values() if hasattr(_names, "values") else _names)))
+        print(f"Error: no {mod} records are left after name filtering "
+              f"(--include_names {args.include_names}, --exclude_names {args.exclude_names}). "
+              "Patterns are regular expressions matched against the file name stored in the log.")
+        if _names:
+            print(f"File names in this log ({len(_names)}; first 30):")
+            for _n in _names[:30]:
+                print(f"  {_n}")
+        sys.exit(1)
     global NAME_WIDTH
     NAME_WIDTH = getattr(args, 'name_width', NAME_WIDTH)
     print_pthread_inventory(dict_list, mod)
     seg_key = op + "_segments"
     want_heatmap = bool(args.pthread_heatmap) and not args.no_plotting
     for idx, _dict in enumerate(dict_list):
-        seg_df = _dict[seg_key]
+        seg_df = order_by_time(_dict[seg_key], sort=getattr(args, 'sort_by_time', False))
         if not args.output_prefix:
             output_prefix = str(_dict.get('name', f"record_{idx}")).replace('/', '_').replace(' ', '_')
         else:
